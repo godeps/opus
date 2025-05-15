@@ -18,3 +18,7 @@ _testmain.go
 # Just noise
 *~
 *.orig
+
+old
+
+build

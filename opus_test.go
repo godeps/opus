@@ -11,7 +11,7 @@ import (
 
 func TestVersion(t *testing.T) {
 	if ver := Version(); !strings.HasPrefix(ver, "libopus") {
-		t.Errorf("Unexpected linked libopus version: " + ver)
+		t.Errorf("Unexpected linked libopus version: %s", ver)
 	}
 }
 
@@ -81,12 +81,13 @@ func TestCodecFloat32(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Couldn't encode data: %v", err)
 	}
+
+	data = data[:n]
 	dec, err := NewDecoder(SAMPLE_RATE, 1)
 	if err != nil || dec == nil {
 		t.Fatalf("Error creating new decoder: %v", err)
 	}
-	// TODO: Uh-oh.. it looks like I forgot to put a data = data[:n] here, yet
-	// the test is not failing. Why?
+
 	n, err = dec.DecodeFloat32(data, pcm)
 	if err != nil {
 		t.Fatalf("Couldn't decode data: %v", err)
@@ -146,7 +147,7 @@ func TestCodecFEC(t *testing.T) {
 			}
 
 			pcmBuffer := make([]int16, samples)
-			if err = dec.DecodeFEC(encodedData[i], pcmBuffer); err != nil {
+			if _, err = dec.DecodeFEC(encodedData[i], pcmBuffer); err != nil {
 				t.Fatalf("Couldn't decode data: %v", err)
 			}
 			pcm = append(pcm, pcmBuffer...)
@@ -229,7 +230,7 @@ func TestCodecFECFloat32(t *testing.T) {
 			}
 
 			pcmBuffer := make([]float32, samples)
-			if err = dec.DecodeFECFloat32(encodedData[i], pcmBuffer); err != nil {
+			if _, err = dec.DecodeFECFloat32(encodedData[i], pcmBuffer); err != nil {
 				t.Fatalf("Couldn't decode data: %v", err)
 			}
 			pcm = append(pcm, pcmBuffer...)
@@ -309,7 +310,7 @@ func TestCodecPLC(t *testing.T) {
 			}
 
 			pcmBuffer := make([]int16, samples)
-			if err = dec.DecodePLC(pcmBuffer); err != nil {
+			if _, err = dec.DecodePLC(pcmBuffer); err != nil {
 				t.Fatalf("Couldn't decode data: %v", err)
 			}
 			nonZero := 0
@@ -399,7 +400,7 @@ func TestCodecPLCFloat32(t *testing.T) {
 			}
 
 			pcmBuffer := make([]float32, samples)
-			if err = dec.DecodePLCFloat32(pcmBuffer); err != nil {
+			if _, err = dec.DecodePLCFloat32(pcmBuffer); err != nil {
 				t.Fatalf("Couldn't decode data: %v", err)
 			}
 			nonZero := 0
@@ -577,7 +578,7 @@ func TestBufferSize(t *testing.T) {
 		dec := createDecoder(t)
 		decodedMem := make([]int16, decodeSize+GUARD_SIZE*2)
 		decodedRef := decodedMem[GUARD_SIZE : GUARD_SIZE+decodeSize : GUARD_SIZE+decodeSize]
-		err := dec.DecodeFEC(data, decodedRef)
+		_, err := dec.DecodeFEC(data, decodedRef)
 		checkGuardInt16(t, decodedMem[:GUARD_SIZE])
 		checkGuardInt16(t, decodedMem[decodeSize+GUARD_SIZE:])
 		checkResult(t, FRAME_SIZE, err, expectOK)
@@ -587,7 +588,7 @@ func TestBufferSize(t *testing.T) {
 		dec := createDecoder(t)
 		decodedMem := make([]float32, decodeSize+GUARD_SIZE*2)
 		decodedRef := decodedMem[GUARD_SIZE : GUARD_SIZE+decodeSize : GUARD_SIZE+decodeSize]
-		err := dec.DecodeFECFloat32(data, decodedRef)
+		_, err := dec.DecodeFECFloat32(data, decodedRef)
 		checkGuardFloat32(t, decodedMem[:GUARD_SIZE])
 		checkGuardFloat32(t, decodedMem[decodeSize+GUARD_SIZE:])
 		checkResult(t, FRAME_SIZE, err, expectOK)
