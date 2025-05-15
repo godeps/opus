@@ -23,12 +23,67 @@ import (
 //go:embed wasm-bridge/build/wasm_bridge
 var opusWasmBinary []byte
 
-// wasmContext holds the shared Wasm runtime and module.
+// WasmFunctions holds cached an api.Function instances from the Wasm module.
+type WasmFunctions struct {
+	// Common
+	Malloc api.Function
+	Free   api.Function
+
+	// Encoder functions
+	OpusEncoderGetSize             api.Function
+	OpusEncoderInit                api.Function
+	OpusEncode                     api.Function
+	OpusEncodeFloat                api.Function
+	BridgeEncoderSetDtx            api.Function
+	BridgeEncoderGetDtx            api.Function
+	BridgeEncoderGetInDtx          api.Function
+	BridgeEncoderGetSampleRate     api.Function
+	BridgeEncoderSetBitrate        api.Function
+	BridgeEncoderGetBitrate        api.Function
+	BridgeEncoderSetComplexity     api.Function
+	BridgeEncoderGetComplexity     api.Function
+	BridgeEncoderSetMaxBandwidth   api.Function
+	BridgeEncoderGetMaxBandwidth   api.Function
+	BridgeEncoderSetInbandFec      api.Function
+	BridgeEncoderGetInbandFec      api.Function
+	BridgeEncoderSetPacketLossPerc api.Function
+	BridgeEncoderGetPacketLossPerc api.Function
+	BridgeEncoderSetVbr            api.Function
+	BridgeEncoderGetVbr            api.Function
+	BridgeEncoderSetVbrConstraint  api.Function
+	BridgeEncoderGetVbrConstraint  api.Function
+	BridgeEncoderResetState        api.Function
+
+	// Decoder functions
+	OpusDecoderGetSize                 api.Function
+	OpusDecoderInit                    api.Function
+	OpusDecode                         api.Function
+	OpusDecodeFloat                    api.Function
+	BridgeDecoderGetLastPacketDuration api.Function
+
+	// Constant getter functions
+	GetOpusOkAddress                     api.Function
+	GetOpusBadArgAddress                 api.Function
+	GetOpusBufferTooSmallAddress         api.Function
+	GetOpusInternalErrorAddress          api.Function
+	GetOpusInvalidPacketAddress          api.Function
+	GetOpusUnimplementedAddress          api.Function
+	GetOpusInvalidStateAddress           api.Function
+	GetOpusAllocFailAddress              api.Function
+	GetOpusBandwidthNarrowbandAddress    api.Function
+	GetOpusBandwidthMediumbandAddress    api.Function
+	GetOpusBandwidthWidebandAddress      api.Function
+	GetOpusBandwidthSuperWidebandAddress api.Function
+	GetOpusBandwidthFullbandAddress      api.Function
+	GetOpusAutoAddress                   api.Function
+	GetOpusBitrateMaxAddress             api.Function
+}
+
+// wasmContext holds the shared Wasm runtime, module, and cached functions.
 type wasmContext struct {
-	runtime wazero.Runtime
-	module  api.Module
-	malloc  api.Function
-	free    api.Function
+	runtime   wazero.Runtime
+	module    api.Module
+	functions WasmFunctions // Changed from malloc/free fields + map to a struct
 	// Add other shared components here if needed
 }
 
@@ -74,118 +129,160 @@ func initWasm(ctx context.Context, wasmBinary []byte) error {
 	_ = ctx
 
 	wasmInitOnce.Do(func() {
-		// Create a new context for the init process if the provided one is nil or already cancelled
 		initCtx := context.Background()
-
 		rt := wazero.NewRuntime(initCtx)
-
-		// Instantiate WASI, if your wasm module needs it.
-		// Opus itself likely doesn't, but the C toolchain (like Emscripten) might add WASI imports.
 		wasi_snapshot_preview1.MustInstantiate(initCtx, rt)
 
 		compiledModule, err := rt.CompileModule(initCtx, wasmBinary)
 		if err != nil {
 			wasmInitErr = fmt.Errorf("failed to compile wasm module: %w", err)
 			log.Printf("initWasm: %v", wasmInitErr)
-			rt.Close(initCtx) // Clean up runtime
+			rt.Close(initCtx)
 			return
 		}
 
-		// Instantiate the module. Use a name that indicates it's a global instance.
-		// Configuration for memory: Opus might need a certain amount.
-		// Default is 1 page (64KB). Check if Opus needs more or if it uses dynamic memory.
-		// For simplicity, we'll use default memory config. If malloc is used, it should grow.
 		cfg := wazero.NewModuleConfig().WithName("opus-global")
 		mod, err := rt.InstantiateModule(initCtx, compiledModule, cfg)
 		if err != nil {
 			wasmInitErr = fmt.Errorf("failed to instantiate wasm module: %w", err)
 			log.Printf("initWasm: %v", wasmInitErr)
-			rt.Close(initCtx)             // Clean up runtime
-			compiledModule.Close(initCtx) // Clean up compiled module
+			rt.Close(initCtx)
+			compiledModule.Close(initCtx)
 			return
 		}
 
-		mallocFn := mod.ExportedFunction("malloc")
-		freeFn := mod.ExportedFunction("free")
-		if mallocFn == nil || freeFn == nil {
-			wasmInitErr = fmt.Errorf("malloc or free not exported from wasm module")
-			log.Printf("initWasm: %v", wasmInitErr)
-			rt.Close(initCtx)             // Clean up runtime
-			compiledModule.Close(initCtx) // Clean up compiled module
-			mod.Close(initCtx)            // Clean up module
+		var funcs WasmFunctions
+		loadFunc := func(name string) api.Function {
+			f := mod.ExportedFunction(name)
+			if f == nil && wasmInitErr == nil { // Only set error if not already set
+				wasmInitErr = fmt.Errorf("wasm function %s not found", name)
+				log.Printf("initWasm: %v", wasmInitErr)
+			}
+			return f
+		}
+
+		// Common
+		funcs.Malloc = loadFunc("malloc")
+		funcs.Free = loadFunc("free")
+
+		// Encoder functions
+		funcs.OpusEncoderGetSize = loadFunc("opus_encoder_get_size")
+		funcs.OpusEncoderInit = loadFunc("opus_encoder_init")
+		funcs.OpusEncode = loadFunc("opus_encode")
+		funcs.OpusEncodeFloat = loadFunc("opus_encode_float")
+		funcs.BridgeEncoderSetDtx = loadFunc("bridge_encoder_set_dtx")
+		funcs.BridgeEncoderGetDtx = loadFunc("bridge_encoder_get_dtx")
+		funcs.BridgeEncoderGetInDtx = loadFunc("bridge_encoder_get_in_dtx")
+		funcs.BridgeEncoderGetSampleRate = loadFunc("bridge_encoder_get_sample_rate")
+		funcs.BridgeEncoderSetBitrate = loadFunc("bridge_encoder_set_bitrate")
+		funcs.BridgeEncoderGetBitrate = loadFunc("bridge_encoder_get_bitrate")
+		funcs.BridgeEncoderSetComplexity = loadFunc("bridge_encoder_set_complexity")
+		funcs.BridgeEncoderGetComplexity = loadFunc("bridge_encoder_get_complexity")
+		funcs.BridgeEncoderSetMaxBandwidth = loadFunc("bridge_encoder_set_max_bandwidth")
+		funcs.BridgeEncoderGetMaxBandwidth = loadFunc("bridge_encoder_get_max_bandwidth")
+		funcs.BridgeEncoderSetInbandFec = loadFunc("bridge_encoder_set_inband_fec")
+		funcs.BridgeEncoderGetInbandFec = loadFunc("bridge_encoder_get_inband_fec")
+		funcs.BridgeEncoderSetPacketLossPerc = loadFunc("bridge_encoder_set_packet_loss_perc")
+		funcs.BridgeEncoderGetPacketLossPerc = loadFunc("bridge_encoder_get_packet_loss_perc")
+		funcs.BridgeEncoderSetVbr = loadFunc("bridge_encoder_set_vbr")
+		funcs.BridgeEncoderGetVbr = loadFunc("bridge_encoder_get_vbr")
+		funcs.BridgeEncoderSetVbrConstraint = loadFunc("bridge_encoder_set_vbr_constraint")
+		funcs.BridgeEncoderGetVbrConstraint = loadFunc("bridge_encoder_get_vbr_constraint")
+		funcs.BridgeEncoderResetState = loadFunc("bridge_encoder_reset_state")
+
+		// Decoder functions
+		funcs.OpusDecoderGetSize = loadFunc("opus_decoder_get_size")
+		funcs.OpusDecoderInit = loadFunc("opus_decoder_init")
+		funcs.OpusDecode = loadFunc("opus_decode")
+		funcs.OpusDecodeFloat = loadFunc("opus_decode_float")
+		funcs.BridgeDecoderGetLastPacketDuration = loadFunc("bridge_decoder_get_last_packet_duration")
+
+		// Constant getter functions
+		funcs.GetOpusOkAddress = loadFunc("get_opus_ok_address")
+		funcs.GetOpusBadArgAddress = loadFunc("get_opus_bad_arg_address")
+		funcs.GetOpusBufferTooSmallAddress = loadFunc("get_opus_buffer_too_small_address")
+		funcs.GetOpusInternalErrorAddress = loadFunc("get_opus_internal_error_address")
+		funcs.GetOpusInvalidPacketAddress = loadFunc("get_opus_invalid_packet_address")
+		funcs.GetOpusUnimplementedAddress = loadFunc("get_opus_unimplemented_address")
+		funcs.GetOpusInvalidStateAddress = loadFunc("get_opus_invalid_state_address")
+		funcs.GetOpusAllocFailAddress = loadFunc("get_opus_alloc_fail_address")
+		funcs.GetOpusBandwidthNarrowbandAddress = loadFunc("get_opus_bandwidth_narrowband_address")
+		funcs.GetOpusBandwidthMediumbandAddress = loadFunc("get_opus_bandwidth_mediumband_address")
+		funcs.GetOpusBandwidthWidebandAddress = loadFunc("get_opus_bandwidth_wideband_address")
+		funcs.GetOpusBandwidthSuperWidebandAddress = loadFunc("get_opus_bandwidth_superwideband_address")
+		funcs.GetOpusBandwidthFullbandAddress = loadFunc("get_opus_bandwidth_fullband_address")
+		funcs.GetOpusAutoAddress = loadFunc("get_opus_auto_address")
+		funcs.GetOpusBitrateMaxAddress = loadFunc("get_opus_bitrate_max_address")
+
+		if wasmInitErr != nil {
+			// If any function failed to load, wasmInitErr is set. Clean up.
+			rt.Close(initCtx)
+			compiledModule.Close(initCtx)
+			mod.Close(initCtx) // mod might be nil if instantiation failed earlier, but Close handles nil.
 			return
 		}
 
 		globalWasmContext = &wasmContext{
-			runtime: rt,
-			module:  mod,
-			malloc:  mallocFn,
-			free:    freeFn,
+			runtime:   rt,
+			module:    mod,
+			functions: funcs,
 		}
 
-		// Load constants from the module. This part might need to be dynamic
-		// or rely on specific exported functions from the Wasm.
-		// Example (assuming functions exist in the wasm module):
-		if err := loadOpusConstants(initCtx, mod); err != nil {
+		if err := loadOpusConstants(initCtx, globalWasmContext); err != nil {
 			wasmInitErr = fmt.Errorf("failed to load opus constants from wasm: %w", err)
 			log.Printf("initWasm: %v", wasmInitErr)
-			// The module and runtime are part of globalWasmContext, which is not fully valid,
-			// but we can rely on the finalizer or explicit Close if needed.
-			// For now, just return the error state.
+			// Cleanup will be handled by CloseWasmContext or finalizers if this part fails
 			return
 		}
 	})
 
-	return wasmInitErr // Return the error from the Do block or nil
+	return wasmInitErr
 }
 
 // mustReadInt32Constant reads an int32 constant from wasm memory via an exported getter function.
-func mustReadInt32Constant(ctx context.Context, module api.Module, funcName string) int32 {
-	fn := module.ExportedFunction(funcName)
-	if fn == nil {
-		log.Fatalf("Wasm function %s not found", funcName)
+// It now takes the api.Function directly.
+func mustReadInt32Constant(ctx context.Context, module api.Module, fn api.Function, funcNameForLog string) int32 {
+	if fn == nil { // Should have been caught during initWasm
+		log.Fatalf("Wasm function for %s is nil", funcNameForLog)
 	}
 	results, err := fn.Call(ctx)
 	if err != nil {
-		log.Fatalf("Failed to call %s: %v", funcName, err)
+		log.Fatalf("Failed to call %s: %v", funcNameForLog, err)
 	}
 	ptr := uint32(results[0])
 	val, ok := module.Memory().ReadUint32Le(ptr)
 	if !ok {
-		log.Fatalf("Failed to read memory at %d for %s", ptr, funcName)
+		log.Fatalf("Failed to read memory at %d for %s", ptr, funcNameForLog)
 	}
 	return int32(val)
 }
 
 // loadOpusConstants loads the Opus constants from the wasm module into global variables.
-func loadOpusConstants(ctx context.Context, module api.Module) error {
-	// This function needs to be populated with the actual constant loading logic
-	// from encoder.go, using the provided 'module'.
+func loadOpusConstants(ctx context.Context, wc *wasmContext) error {
+	// Pass the module and the specific function from the cached WasmFunctions struct
+	opusOk = mustReadInt32Constant(ctx, wc.module, wc.functions.GetOpusOkAddress, "get_opus_ok_address")
+	opusBadArg = mustReadInt32Constant(ctx, wc.module, wc.functions.GetOpusBadArgAddress, "get_opus_bad_arg_address")
+	opusBufferTooSmall = mustReadInt32Constant(ctx, wc.module, wc.functions.GetOpusBufferTooSmallAddress, "get_opus_buffer_too_small_address")
+	opusInternalError = mustReadInt32Constant(ctx, wc.module, wc.functions.GetOpusInternalErrorAddress, "get_opus_internal_error_address")
+	opusInvalidPacket = mustReadInt32Constant(ctx, wc.module, wc.functions.GetOpusInvalidPacketAddress, "get_opus_invalid_packet_address")
+	opusUnimplemented = mustReadInt32Constant(ctx, wc.module, wc.functions.GetOpusUnimplementedAddress, "get_opus_unimplemented_address")
+	opusInvalidState = mustReadInt32Constant(ctx, wc.module, wc.functions.GetOpusInvalidStateAddress, "get_opus_invalid_state_address")
+	opusAllocFail = mustReadInt32Constant(ctx, wc.module, wc.functions.GetOpusAllocFailAddress, "get_opus_alloc_fail_address")
 
-	opusOk = mustReadInt32Constant(ctx, module, "get_opus_ok_address")
-	opusBadArg = mustReadInt32Constant(ctx, module, "get_opus_bad_arg_address")
-	opusBufferTooSmall = mustReadInt32Constant(ctx, module, "get_opus_buffer_too_small_address")
-	opusInternalError = mustReadInt32Constant(ctx, module, "get_opus_internal_error_address")
-	opusInvalidPacket = mustReadInt32Constant(ctx, module, "get_opus_invalid_packet_address")
-	opusUnimplemented = mustReadInt32Constant(ctx, module, "get_opus_unimplemented_address")
-	opusInvalidState = mustReadInt32Constant(ctx, module, "get_opus_invalid_state_address")
-	opusAllocFail = mustReadInt32Constant(ctx, module, "get_opus_alloc_fail_address")
+	opusBandwidthNarrowband = mustReadInt32Constant(ctx, wc.module, wc.functions.GetOpusBandwidthNarrowbandAddress, "get_opus_bandwidth_narrowband_address")
+	opusBandwidthMediumband = mustReadInt32Constant(ctx, wc.module, wc.functions.GetOpusBandwidthMediumbandAddress, "get_opus_bandwidth_mediumband_address")
+	opusBandwidthWideband = mustReadInt32Constant(ctx, wc.module, wc.functions.GetOpusBandwidthWidebandAddress, "get_opus_bandwidth_wideband_address")
+	opusBandwidthSuperWideband = mustReadInt32Constant(ctx, wc.module, wc.functions.GetOpusBandwidthSuperWidebandAddress, "get_opus_bandwidth_superwideband_address")
+	opusBandwidthFullband = mustReadInt32Constant(ctx, wc.module, wc.functions.GetOpusBandwidthFullbandAddress, "get_opus_bandwidth_fullband_address")
 
-	opusBandwidthNarrowband = mustReadInt32Constant(ctx, module, "get_opus_bandwidth_narrowband_address")
-	opusBandwidthMediumband = mustReadInt32Constant(ctx, module, "get_opus_bandwidth_mediumband_address")
-	opusBandwidthWideband = mustReadInt32Constant(ctx, module, "get_opus_bandwidth_wideband_address")
-	opusBandwidthSuperWideband = mustReadInt32Constant(ctx, module, "get_opus_bandwidth_superwideband_address")
-	opusBandwidthFullband = mustReadInt32Constant(ctx, module, "get_opus_bandwidth_fullband_address")
-
-	// Update Bandwidth variables
 	Narrowband = Bandwidth(opusBandwidthNarrowband)
 	Mediumband = Bandwidth(opusBandwidthMediumband)
 	Wideband = Bandwidth(opusBandwidthWideband)
 	SuperWideband = Bandwidth(opusBandwidthSuperWideband)
 	Fullband = Bandwidth(opusBandwidthFullband)
 
-	opusAuto = mustReadInt32Constant(ctx, module, "get_opus_auto_address")
-	opusBitrateMax = mustReadInt32Constant(ctx, module, "get_opus_bitrate_max_address")
+	opusAuto = mustReadInt32Constant(ctx, wc.module, wc.functions.GetOpusAutoAddress, "get_opus_auto_address")
+	opusBitrateMax = mustReadInt32Constant(ctx, wc.module, wc.functions.GetOpusBitrateMaxAddress, "get_opus_bitrate_max_address")
 
 	return nil
 }
@@ -206,10 +303,11 @@ func CloseWasmContext(ctx context.Context) error {
 		err := globalWasmContext.runtime.Close(ctx)
 		globalWasmContext.runtime = nil // Prevent double close
 		globalWasmContext.module = nil
-		globalWasmContext.malloc = nil
-		globalWasmContext.free = nil
-		globalWasmContext = nil    // Clear the global context
-		wasmInitOnce = sync.Once{} // Reset the initOnce for potential re-init in tests etc.
+		// globalWasmContext.malloc = nil // These are now part of globalWasmContext.functions
+		// globalWasmContext.free = nil
+		globalWasmContext.functions = WasmFunctions{} // Clear cached functions struct
+		globalWasmContext = nil                       // Clear the global context
+		wasmInitOnce = sync.Once{}                    // Reset the initOnce for potential re-init in tests etc.
 		wasmInitErr = nil
 		return err
 	}
@@ -222,30 +320,28 @@ func CloseWasmContext(ctx context.Context) error {
 // writeToMemory writes a Go byte slice to wasm memory using the wasmContext's malloc.
 func (wc *wasmContext) writeToMemory(ctx context.Context, data []byte) (ptr uint32, err error) {
 	byteCount := uint32(len(data))
-	if byteCount == 0 {
-		// For some Opus calls (like PLC), a 0-len data is valid with a NULL ptr.
-		// This helper is for writing existing Go data. If data is non-nil but empty,
-		// malloc(0) might be problematic or return non-NULL, but it's unusual to write 0 bytes this way.
-		// The original check was specific to non-nil empty slices.
-		// Let's assume if len(data) is 0, the caller intends this (e.g. for an empty buffer placeholder).
-		// However, directly allocating for 0 bytes to write *into* is often an error.
-		// Given this is writing *from* a Go slice, if the slice is empty, we allocate 0.
-		// Many mallocs return NULL or a unique pointer for malloc(0). We'll proceed.
+	// Note: malloc(0) behavior can be platform-dependent. Wazero's malloc (if from emscripten)
+	// might return a non-NULL pointer or NULL. If it's NULL, and byteCount is 0, it's fine.
+	// If byteCount > 0 and malloc returns NULL, that's an error.
+
+	if wc.functions.Malloc == nil {
+		return 0, fmt.Errorf("wasm malloc function not initialized in wasmContext")
 	}
 
-	results, err := wc.malloc.Call(ctx, uint64(byteCount))
+	results, err := wc.functions.Malloc.Call(ctx, uint64(byteCount))
 	if err != nil {
 		return 0, fmt.Errorf("wasm malloc failed: %w", err)
 	}
 	ptr = uint32(results[0])
-	if ptr == 0 && byteCount > 0 { // If malloc(0) returns 0, that might be valid. But not for byteCount > 0.
-		return 0, fmt.Errorf("wasm malloc returned NULL for non-zero size")
+	if ptr == 0 && byteCount > 0 {
+		return 0, fmt.Errorf("wasm malloc returned NULL for non-zero size (%d bytes)", byteCount)
 	}
-	if byteCount > 0 { // Only write if there's data to write
+
+	if byteCount > 0 {
 		if !wc.module.Memory().Write(ptr, data) {
-			// Attempt to free if write failed
-			if ptr != 0 { // Check ptr before calling free
-				wc.free.Call(ctx, uint64(ptr))
+			if ptr != 0 && wc.functions.Free != nil {
+				// Attempt to free if write failed, but only if free is available
+				wc.functions.Free.Call(ctx, uint64(ptr))
 			}
 			return 0, fmt.Errorf("wasm memory write failed")
 		}
@@ -255,7 +351,10 @@ func (wc *wasmContext) writeToMemory(ctx context.Context, data []byte) (ptr uint
 
 // allocateInt32Ptr allocates memory for an int32 in wasm memory using the wasmContext's malloc.
 func (wc *wasmContext) allocateInt32Ptr(ctx context.Context) (ptr uint32, err error) {
-	results, err := wc.malloc.Call(ctx, 4) // sizeof(int32) is 4
+	if wc.functions.Malloc == nil {
+		return 0, fmt.Errorf("wasm malloc function not initialized in wasmContext for allocateInt32Ptr")
+	}
+	results, err := wc.functions.Malloc.Call(ctx, 4) // sizeof(int32) is 4
 	if err != nil {
 		return 0, fmt.Errorf("wasm malloc for int32 ptr failed: %w", err)
 	}
@@ -264,6 +363,21 @@ func (wc *wasmContext) allocateInt32Ptr(ctx context.Context) (ptr uint32, err er
 		return 0, fmt.Errorf("wasm malloc for int32 ptr returned NULL")
 	}
 	return ptr, nil
+}
+
+// freeMemory calls the Wasm free function.
+func (wc *wasmContext) freeMemory(ctx context.Context, ptr uint32) error {
+	if ptr == 0 {
+		return nil // Freeing a null pointer is a no-op.
+	}
+	if wc.functions.Free == nil {
+		return fmt.Errorf("wasm free function not initialized in wasmContext")
+	}
+	_, err := wc.functions.Free.Call(ctx, uint64(ptr))
+	if err != nil {
+		return fmt.Errorf("wasm free call failed: %w", err)
+	}
+	return nil
 }
 
 // --- Shared Helper functions for byte slice conversions ---

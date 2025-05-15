@@ -23,15 +23,6 @@ const (
 	AppRestrictedLowdelay = Application(2051) // OPUS_APPLICATION_RESTRICTED_LOWDELAY
 )
 
-const (
-	xMAX_BITRATE       = 48000
-	xMAX_FRAME_SIZE_MS = 60
-	xMAX_FRAME_SIZE    = xMAX_BITRATE * xMAX_FRAME_SIZE_MS / 1000
-	// Maximum size of an encoded frame. I actually have no idea, but this
-	// looks like it's big enough.
-	maxEncodedFrameSize = 10000
-)
-
 func Version() string {
 	ctx := context.Background() // Context for initialization
 	wctx, err := GetWasmContext(ctx)

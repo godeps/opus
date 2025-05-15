@@ -10,7 +10,8 @@ import (
 	"context"
 	"fmt"
 	"runtime"
-	// "github.com/tetratelabs/wazero/api" // No longer directly needed, accessed via wctx
+
+	"github.com/tetratelabs/wazero/api" // Added for api.Function type
 	// "unsafe" // Only needed if byte slice helpers using unsafe are copied here directly
 	// "log" // Only if new logging specific to decoder is added
 )
@@ -53,9 +54,10 @@ func NewDecoder(sampleRate int, channels int) (*Decoder, error) {
 
 	// Set finalizer to free Wasm memory when Decoder is GC'd
 	runtime.SetFinalizer(dec, func(d *Decoder) {
-		if d.decoderPtr != 0 && d.wctx != nil && d.wctx.free != nil {
+		if d.decoderPtr != 0 && d.wctx != nil && d.wctx.functions.Free != nil {
 			// Similar to Encoder, use context.Background() cautiously.
-			_, finErr := d.wctx.free.Call(context.Background(), uint64(d.decoderPtr))
+			// Directly call Free here as freeMemory helper returns an error we can't easily handle in a finalizer.
+			_, finErr := d.wctx.functions.Free.Call(context.Background(), uint64(d.decoderPtr))
 			if finErr != nil {
 				fmt.Printf("opus: error freeing Wasm decoder memory in finalizer: %v\n", finErr)
 			}
@@ -79,9 +81,9 @@ func (dec *Decoder) Init(sampleRate int, channels int) error {
 	}
 	ctx := context.Background()
 
-	opusDecoderGetSize := dec.wctx.module.ExportedFunction("opus_decoder_get_size")
+	opusDecoderGetSize := dec.wctx.functions.OpusDecoderGetSize
 	if opusDecoderGetSize == nil {
-		return fmt.Errorf("opus_decoder_get_size not found in Wasm module")
+		return fmt.Errorf("opus_decoder_get_size not found in Wasm functions cache")
 	}
 
 	results, err := opusDecoderGetSize.Call(ctx, uint64(channels))
@@ -90,7 +92,10 @@ func (dec *Decoder) Init(sampleRate int, channels int) error {
 	}
 	size := uint32(results[0])
 
-	results, err = dec.wctx.malloc.Call(ctx, uint64(size))
+	if dec.wctx.functions.Malloc == nil {
+		return fmt.Errorf("wasm malloc function not initialized in decoder")
+	}
+	results, err = dec.wctx.functions.Malloc.Call(ctx, uint64(size))
 	if err != nil {
 		return fmt.Errorf("wasm malloc for decoder failed: %w", err)
 	}
@@ -99,22 +104,22 @@ func (dec *Decoder) Init(sampleRate int, channels int) error {
 		return fmt.Errorf("wasm malloc returned NULL for decoder")
 	}
 
-	opusDecoderInit := dec.wctx.module.ExportedFunction("opus_decoder_init")
+	opusDecoderInit := dec.wctx.functions.OpusDecoderInit
 	if opusDecoderInit == nil {
-		dec.wctx.free.Call(ctx, uint64(dec.decoderPtr)) // Clean up
+		dec.wctx.freeMemory(ctx, dec.decoderPtr) // Clean up
 		dec.decoderPtr = 0
-		return fmt.Errorf("opus_decoder_init not found in Wasm module")
+		return fmt.Errorf("opus_decoder_init not found in Wasm functions cache")
 	}
 
 	results, err = opusDecoderInit.Call(ctx, uint64(dec.decoderPtr), uint64(int32(sampleRate)), uint64(int32(channels)))
 	if err != nil {
-		dec.wctx.free.Call(ctx, uint64(dec.decoderPtr)) // Clean up
+		dec.wctx.freeMemory(ctx, dec.decoderPtr) // Clean up
 		dec.decoderPtr = 0
 		return fmt.Errorf("opus_decoder_init call failed: %w", err)
 	}
 	errno := int32(results[0])
 	if errno != opusOk { // opusOk is a global constant
-		dec.wctx.free.Call(ctx, uint64(dec.decoderPtr)) // Clean up
+		dec.wctx.freeMemory(ctx, dec.decoderPtr) // Clean up
 		dec.decoderPtr = 0
 		return Error(int(errno))
 	}
@@ -124,7 +129,7 @@ func (dec *Decoder) Init(sampleRate int, channels int) error {
 	return nil
 }
 
-func (dec *Decoder) decodeInternal(data []byte, pcmPtr uint32, pcmLenBytes int, frameSize int, decodeFEC int, isFloat bool) (int, error) {
+func (dec *Decoder) decodeInternal(data []byte, pcmPtr uint32, frameSize int, decodeFEC int, isFloat bool) (int, error) {
 	if dec.decoderPtr == 0 || dec.wctx == nil {
 		return 0, errDecUninitialized
 	}
@@ -133,12 +138,12 @@ func (dec *Decoder) decodeInternal(data []byte, pcmPtr uint32, pcmLenBytes int, 
 	var dataPtr uint32
 	var err error
 
-	if data != nil && len(data) > 0 {
+	if len(data) > 0 {
 		dataPtr, err = dec.wctx.writeToMemory(ctx, data) // Use method from wasmContext
 		if err != nil {
 			return 0, fmt.Errorf("failed to write input data to Wasm memory: %w", err)
 		}
-		defer dec.wctx.free.Call(ctx, uint64(dataPtr)) // Use free from wasmContext
+		defer dec.wctx.freeMemory(ctx, dataPtr) // Use free from wasmContext
 	} else {
 		// For PLC, data is NULL (represented by 0 pointer) and length is 0
 		dataPtr = 0 // Remains 0 if data is nil or empty, writeToMemory handles malloc(0) if needed
@@ -149,19 +154,22 @@ func (dec *Decoder) decodeInternal(data []byte, pcmPtr uint32, pcmLenBytes int, 
 		dataLen = 0
 	}
 
-	var decodeFuncName string
+	var decodeFunc api.Function
+	var funcNameForLog string // For logging purposes
+
 	if isFloat {
-		decodeFuncName = "opus_decode_float"
+		decodeFunc = dec.wctx.functions.OpusDecodeFloat
+		funcNameForLog = "opus_decode_float"
 	} else {
-		decodeFuncName = "opus_decode"
+		decodeFunc = dec.wctx.functions.OpusDecode
+		funcNameForLog = "opus_decode"
 	}
 
-	opusDecodeFunc := dec.wctx.module.ExportedFunction(decodeFuncName)
-	if opusDecodeFunc == nil {
-		return 0, fmt.Errorf("%s not found in Wasm module (wctx module: %v)", decodeFuncName, dec.wctx.module)
+	if decodeFunc == nil {
+		return 0, fmt.Errorf("%s not found in Wasm functions cache", funcNameForLog)
 	}
 
-	results, err := opusDecodeFunc.Call(ctx,
+	results, err := decodeFunc.Call(ctx,
 		uint64(dec.decoderPtr),
 		uint64(dataPtr),          // pointer to encoded data, or 0 for PLC
 		uint64(int32(dataLen)),   // length of data, or 0 for PLC
@@ -170,7 +178,7 @@ func (dec *Decoder) decodeInternal(data []byte, pcmPtr uint32, pcmLenBytes int, 
 		uint64(int32(decodeFEC)), // 0 for no FEC, 1 for FEC
 	)
 	if err != nil {
-		return 0, fmt.Errorf("%s call failed: %w", decodeFuncName, err)
+		return 0, fmt.Errorf("%s call failed: %w", funcNameForLog, err)
 	}
 
 	samplesDecoded := int32(results[0])
@@ -206,11 +214,11 @@ func (dec *Decoder) Decode(data []byte, pcm []int16) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("failed to allocate Wasm memory for PCM output: %w", err)
 	}
-	defer dec.wctx.free.Call(ctx, uint64(pcmPtr))
+	defer dec.wctx.freeMemory(ctx, pcmPtr)
 
 	// frameSize is samples per channel, pcmLenBytes is total bytes for allocation
 	frameSize := cap(pcm) / dec.channels
-	samplesDecoded, err := dec.decodeInternal(data, pcmPtr, pcmAllocSizeBytes, frameSize, 0, false)
+	samplesDecoded, err := dec.decodeInternal(data, pcmPtr, frameSize, 0, false)
 	if err != nil {
 		return 0, err
 	}
@@ -255,10 +263,10 @@ func (dec *Decoder) DecodeFloat32(data []byte, pcm []float32) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("failed to allocate Wasm memory for PCM output: %w", err)
 	}
-	defer dec.wctx.free.Call(ctx, uint64(pcmPtr))
+	defer dec.wctx.freeMemory(ctx, pcmPtr)
 
 	frameSize := cap(pcm) / dec.channels
-	samplesDecoded, err := dec.decodeInternal(data, pcmPtr, pcmAllocSizeBytes, frameSize, 0, true)
+	samplesDecoded, err := dec.decodeInternal(data, pcmPtr, frameSize, 0, true)
 	if err != nil {
 		return 0, err
 	}
@@ -299,10 +307,10 @@ func (dec *Decoder) DecodeFEC(data []byte, pcm []int16) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("failed to allocate Wasm memory for FEC PCM output: %w", err)
 	}
-	defer dec.wctx.free.Call(ctx, uint64(pcmPtr))
+	defer dec.wctx.freeMemory(ctx, pcmPtr)
 
 	frameSize := cap(pcm) / dec.channels
-	samplesDecoded, err := dec.decodeInternal(data, pcmPtr, pcmAllocSizeBytes, frameSize, 1, false) // decode_fec = 1
+	samplesDecoded, err := dec.decodeInternal(data, pcmPtr, frameSize, 1, false) // decode_fec = 1
 	if err != nil {
 		return 0, err
 	}
@@ -341,10 +349,10 @@ func (dec *Decoder) DecodeFECFloat32(data []byte, pcm []float32) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("failed to allocate Wasm memory for FEC PCM output: %w", err)
 	}
-	defer dec.wctx.free.Call(ctx, uint64(pcmPtr))
+	defer dec.wctx.freeMemory(ctx, pcmPtr)
 
 	frameSize := cap(pcm) / dec.channels
-	samplesDecoded, err := dec.decodeInternal(data, pcmPtr, pcmAllocSizeBytes, frameSize, 1, true) // decode_fec = 1
+	samplesDecoded, err := dec.decodeInternal(data, pcmPtr, frameSize, 1, true) // decode_fec = 1
 	if err != nil {
 		return 0, err
 	}
@@ -383,11 +391,11 @@ func (dec *Decoder) DecodePLC(pcm []int16) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("failed to allocate Wasm memory for PLC PCM output: %w", err)
 	}
-	defer dec.wctx.free.Call(ctx, uint64(pcmPtr))
+	defer dec.wctx.freeMemory(ctx, pcmPtr)
 
 	frameSize := cap(pcm) / dec.channels
 	// For PLC, data is NULL (dataPtr=0) and dataLen is 0. decodeInternal handles data=nil.
-	samplesDecoded, err := dec.decodeInternal(nil, pcmPtr, pcmAllocSizeBytes, frameSize, 0, false)
+	samplesDecoded, err := dec.decodeInternal(nil, pcmPtr, frameSize, 0, false)
 	if err != nil {
 		return 0, err
 	}
@@ -426,10 +434,10 @@ func (dec *Decoder) DecodePLCFloat32(pcm []float32) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("failed to allocate Wasm memory for PLC PCM output: %w", err)
 	}
-	defer dec.wctx.free.Call(ctx, uint64(pcmPtr))
+	defer dec.wctx.freeMemory(ctx, pcmPtr)
 
 	frameSize := cap(pcm) / dec.channels
-	samplesDecoded, err := dec.decodeInternal(nil, pcmPtr, pcmAllocSizeBytes, frameSize, 0, true)
+	samplesDecoded, err := dec.decodeInternal(nil, pcmPtr, frameSize, 0, true)
 	if err != nil {
 		return 0, err
 	}
@@ -453,9 +461,9 @@ func (dec *Decoder) LastPacketDuration() (int, error) {
 	if dec.decoderPtr == 0 || dec.wctx == nil {
 		return 0, errDecUninitialized
 	}
-	ctlFunc := dec.wctx.module.ExportedFunction("bridge_decoder_get_last_packet_duration")
+	ctlFunc := dec.wctx.functions.BridgeDecoderGetLastPacketDuration
 	if ctlFunc == nil {
-		return 0, fmt.Errorf("bridge_decoder_get_last_packet_duration not found in Wasm module (wctx module: %v)", dec.wctx.module)
+		return 0, fmt.Errorf("bridge_decoder_get_last_packet_duration not found in Wasm functions cache")
 	}
 
 	ctx := context.Background()
@@ -463,7 +471,7 @@ func (dec *Decoder) LastPacketDuration() (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer dec.wctx.free.Call(ctx, uint64(samplesPtr)) // Use free from wasmContext
+	defer dec.wctx.freeMemory(ctx, samplesPtr) // Use free from wasmContext
 
 	results, err := ctlFunc.Call(ctx, uint64(dec.decoderPtr), uint64(samplesPtr))
 	if err != nil {

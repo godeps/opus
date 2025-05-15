@@ -99,6 +99,34 @@ bridge_encoder_get_packet_loss_perc(OpusEncoder *st, opus_int32 *loss_perc)
 	return opus_encoder_ctl(st, OPUS_GET_PACKET_LOSS_PERC(loss_perc));
 }
 
+EXPORT(bridge_encoder_set_vbr)
+int 
+bridge_encoder_set_vbr(OpusEncoder *st, opus_int32 vbr)
+{
+	return opus_encoder_ctl(st, OPUS_SET_VBR(vbr));
+}
+
+EXPORT(bridge_encoder_get_vbr)
+int 
+bridge_encoder_get_vbr(OpusEncoder *st, opus_int32 *vbr)
+{
+	return opus_encoder_ctl(st, OPUS_GET_VBR(vbr));
+}
+
+EXPORT(bridge_encoder_set_vbr_constraint)
+int 
+bridge_encoder_set_vbr_constraint(OpusEncoder *st, opus_int32 vbr_constraint)
+{
+	return opus_encoder_ctl(st, OPUS_SET_VBR_CONSTRAINT(vbr_constraint));
+}
+
+EXPORT(bridge_encoder_get_vbr_constraint)
+int 
+bridge_encoder_get_vbr_constraint(OpusEncoder *st, opus_int32 *vbr_constraint)
+{
+	return opus_encoder_ctl(st, OPUS_GET_VBR_CONSTRAINT(vbr_constraint));
+}
+
 EXPORT(bridge_encoder_reset_state)
 int
 bridge_encoder_reset_state(OpusEncoder *st)

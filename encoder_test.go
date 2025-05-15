@@ -391,3 +391,45 @@ func TestEncoder_Reset(t *testing.T) {
 	}
 	RunTestCodec(t, enc)
 }
+
+func TestEncoder_SetGetVBR(t *testing.T) {
+	enc, err := NewEncoder(8000, 1, AppVoIP)
+	if err != nil || enc == nil {
+		t.Errorf("Error creating new encoder: %v", err)
+	}
+	vals := []bool{true, false}
+	for _, vbrMode := range vals {
+		err := enc.SetVBR(vbrMode)
+		if err != nil {
+			t.Errorf("Error setting VBR to %t: %v", vbrMode, err)
+		}
+		gotVbr, err := enc.VBR()
+		if err != nil {
+			t.Errorf("Error getting VBR (%t): %v", vbrMode, err)
+		}
+		if gotVbr != vbrMode {
+			t.Errorf("Unexpected VBR mode. Got %t, but expected %t", gotVbr, vbrMode)
+		}
+	}
+}
+
+func TestEncoder_SetGetVBRConstraint(t *testing.T) {
+	enc, err := NewEncoder(8000, 1, AppVoIP)
+	if err != nil || enc == nil {
+		t.Errorf("Error creating new encoder: %v", err)
+	}
+	vals := []bool{true, false}
+	for _, constraint := range vals {
+		err := enc.SetVBRConstraint(constraint)
+		if err != nil {
+			t.Errorf("Error setting VBRConstraint to %t: %v", constraint, err)
+		}
+		gotConstraint, err := enc.VBRConstraint()
+		if err != nil {
+			t.Errorf("Error getting VBRConstraint (%t): %v", constraint, err)
+		}
+		if gotConstraint != constraint {
+			t.Errorf("Unexpected VBRConstraint value. Got %t, but expected %t", gotConstraint, constraint)
+		}
+	}
+}

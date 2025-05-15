@@ -10,9 +10,8 @@ import (
 	"context"
 	"fmt"
 	"runtime"
-	// "sync" // No longer needed here for initOnce
-	// "github.com/tetratelabs/wazero" // Runtime managed by wasmContext
-	// Still needed for api.Module etc. if used directly (but mostly via wasmContext)
+
+	"github.com/tetratelabs/wazero/api"
 )
 
 var errEncUninitialized = fmt.Errorf("opus encoder uninitialized")
@@ -48,13 +47,14 @@ func NewEncoder(sampleRate int, channels int, application Application) (*Encoder
 	}
 	// Set finalizer to free Wasm memory when Encoder is GC'd
 	runtime.SetFinalizer(enc, func(e *Encoder) {
-		if e.encoderPtr != 0 && e.wctx != nil && e.wctx.free != nil {
+		if e.encoderPtr != 0 && e.wctx != nil && e.wctx.functions.Free != nil {
 			// It's tricky to use context in finalizers.
 			// Using context.Background() here, but be cautious.
 			// We also need to ensure the module memory is still valid, which implies the runtime is alive.
 			// The CloseWasmContext should be the primary mechanism for cleanup.
 			// Finalizers are a fallback.
-			_, finErr := e.wctx.free.Call(context.Background(), uint64(e.encoderPtr))
+			// Directly call Free here as freeMemory helper returns an error we can't easily handle in a finalizer.
+			_, finErr := e.wctx.functions.Free.Call(context.Background(), uint64(e.encoderPtr))
 			if finErr != nil {
 				// Log error, as we can't return it from a finalizer
 				fmt.Printf("opus: error freeing Wasm encoder memory in finalizer: %v\n", finErr)
@@ -77,9 +77,9 @@ func (enc *Encoder) init(ctx context.Context, sampleRate int, channels int, appl
 		return fmt.Errorf("wasm context or module not initialized in encoder")
 	}
 
-	opusEncoderGetSize := enc.wctx.module.ExportedFunction("opus_encoder_get_size")
+	opusEncoderGetSize := enc.wctx.functions.OpusEncoderGetSize
 	if opusEncoderGetSize == nil {
-		return fmt.Errorf("opus_encoder_get_size not found in Wasm module")
+		return fmt.Errorf("opus_encoder_get_size not found in Wasm functions cache")
 	}
 
 	results, err := opusEncoderGetSize.Call(ctx, uint64(channels))
@@ -89,7 +89,10 @@ func (enc *Encoder) init(ctx context.Context, sampleRate int, channels int, appl
 	size := uint32(results[0])
 
 	// Use wctx's malloc
-	results, err = enc.wctx.malloc.Call(ctx, uint64(size))
+	if enc.wctx.functions.Malloc == nil {
+		return fmt.Errorf("wasm malloc function not initialized in encoder")
+	}
+	results, err = enc.wctx.functions.Malloc.Call(ctx, uint64(size))
 	if err != nil {
 		return fmt.Errorf("wasm malloc for encoder failed: %w", err)
 	}
@@ -98,22 +101,22 @@ func (enc *Encoder) init(ctx context.Context, sampleRate int, channels int, appl
 		return fmt.Errorf("wasm malloc returned NULL for encoder")
 	}
 
-	opusEncoderInit := enc.wctx.module.ExportedFunction("opus_encoder_init")
+	opusEncoderInit := enc.wctx.functions.OpusEncoderInit
 	if opusEncoderInit == nil {
-		enc.wctx.free.Call(ctx, uint64(enc.encoderPtr)) // Clean up allocated memory
+		enc.wctx.freeMemory(ctx, enc.encoderPtr) // Clean up allocated memory
 		enc.encoderPtr = 0
-		return fmt.Errorf("opus_encoder_init not found in Wasm module")
+		return fmt.Errorf("opus_encoder_init not found in Wasm functions cache")
 	}
 
 	results, err = opusEncoderInit.Call(ctx, uint64(enc.encoderPtr), uint64(int32(sampleRate)), uint64(int32(channels)), uint64(int32(application)))
 	if err != nil {
-		enc.wctx.free.Call(ctx, uint64(enc.encoderPtr)) // Clean up
+		enc.wctx.freeMemory(ctx, enc.encoderPtr) // Clean up
 		enc.encoderPtr = 0
 		return fmt.Errorf("opus_encoder_init call failed: %w", err)
 	}
 	errno := int32(results[0])
 	if errno != opusOk { // opusOk is a global constant from wasm_context.go
-		enc.wctx.free.Call(ctx, uint64(enc.encoderPtr)) // Clean up
+		enc.wctx.freeMemory(ctx, enc.encoderPtr) // Clean up
 		enc.encoderPtr = 0
 		return Error(int(errno))
 	}
@@ -145,7 +148,7 @@ func (enc *Encoder) Encode(pcm []int16, data []byte) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("failed to write PCM to Wasm memory: %w", err)
 	}
-	defer enc.wctx.free.Call(ctx, uint64(pcmPtr))
+	defer enc.wctx.freeMemory(ctx, pcmPtr)
 
 	// For output, we need to allocate memory. The 'data' slice is the Go buffer.
 	// We need to allocate Wasm memory of the same size for Opus to write into.
@@ -153,11 +156,11 @@ func (enc *Encoder) Encode(pcm []int16, data []byte) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("failed to allocate Wasm memory for output data: %w", err)
 	}
-	defer enc.wctx.free.Call(ctx, uint64(dataWasmPtr))
+	defer enc.wctx.freeMemory(ctx, dataWasmPtr)
 
-	opusEncode := enc.wctx.module.ExportedFunction("opus_encode")
+	opusEncode := enc.wctx.functions.OpusEncode
 	if opusEncode == nil {
-		return 0, fmt.Errorf("opus_encode not found in Wasm module")
+		return 0, fmt.Errorf("opus_encode not found in Wasm functions cache")
 	}
 
 	results, err := opusEncode.Call(ctx,
@@ -214,17 +217,17 @@ func (enc *Encoder) EncodeFloat32(pcm []float32, data []byte) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("failed to write PCM to Wasm memory: %w", err)
 	}
-	defer enc.wctx.free.Call(ctx, uint64(pcmPtr))
+	defer enc.wctx.freeMemory(ctx, pcmPtr)
 
 	dataWasmPtr, err := enc.wctx.writeToMemory(ctx, make([]byte, len(data))) // Allocate for output
 	if err != nil {
 		return 0, fmt.Errorf("failed to allocate Wasm memory for output data: %w", err)
 	}
-	defer enc.wctx.free.Call(ctx, uint64(dataWasmPtr))
+	defer enc.wctx.freeMemory(ctx, dataWasmPtr)
 
-	opusEncodeFloat := enc.wctx.module.ExportedFunction("opus_encode_float")
+	opusEncodeFloat := enc.wctx.functions.OpusEncodeFloat
 	if opusEncodeFloat == nil {
-		return 0, fmt.Errorf("opus_encode_float not found in Wasm module")
+		return 0, fmt.Errorf("opus_encode_float not found in Wasm functions cache")
 	}
 
 	results, err := opusEncodeFloat.Call(ctx,
@@ -257,18 +260,17 @@ func (enc *Encoder) EncodeFloat32(pcm []float32, data []byte) (int, error) {
 
 // --- Generic CTL Getters/Setters ---
 
-func (enc *Encoder) setCtlInt32(funcName string, value int32) error {
+func (enc *Encoder) setCtlInt32(ctlFunc api.Function, value int32) error {
 	if enc.encoderPtr == 0 || enc.wctx == nil {
 		return errEncUninitialized
 	}
-	ctlFunc := enc.wctx.module.ExportedFunction(funcName)
 	if ctlFunc == nil {
-		return fmt.Errorf("%s not found in Wasm module (wctx module: %v)", funcName, enc.wctx.module)
+		return fmt.Errorf("ctl function is nil for setCtlInt32")
 	}
 	ctx := context.Background()
 	results, err := ctlFunc.Call(ctx, uint64(enc.encoderPtr), uint64(value))
 	if err != nil {
-		return fmt.Errorf("%s call failed: %w", funcName, err)
+		return fmt.Errorf("wasm ctl function call failed for setCtlInt32: %w", err)
 	}
 	res := int32(results[0])
 	if res != opusOk {
@@ -277,13 +279,12 @@ func (enc *Encoder) setCtlInt32(funcName string, value int32) error {
 	return nil
 }
 
-func (enc *Encoder) getCtlInt32(funcName string) (int32, error) {
+func (enc *Encoder) getCtlInt32(ctlFunc api.Function) (int32, error) {
 	if enc.encoderPtr == 0 || enc.wctx == nil {
 		return 0, errEncUninitialized
 	}
-	ctlFunc := enc.wctx.module.ExportedFunction(funcName)
 	if ctlFunc == nil {
-		return 0, fmt.Errorf("%s not found in Wasm module (wctx module: %v)", funcName, enc.wctx.module)
+		return 0, fmt.Errorf("ctl function is nil for getCtlInt32")
 	}
 
 	ctx := context.Background()
@@ -291,11 +292,11 @@ func (enc *Encoder) getCtlInt32(funcName string) (int32, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer enc.wctx.free.Call(ctx, uint64(valPtr)) // Use free from wasmContext
+	defer enc.wctx.freeMemory(ctx, valPtr) // Use free from wasmContext
 
 	results, err := ctlFunc.Call(ctx, uint64(enc.encoderPtr), uint64(valPtr))
 	if err != nil {
-		return 0, fmt.Errorf("%s call failed: %w", funcName, err)
+		return 0, fmt.Errorf("wasm ctl function call failed for getCtlInt32: %w", err)
 	}
 	res := int32(results[0])
 	if res != opusOk { // opusOk is global
@@ -303,7 +304,7 @@ func (enc *Encoder) getCtlInt32(funcName string) (int32, error) {
 	}
 	value, ok := enc.wctx.module.Memory().ReadUint32Le(valPtr)
 	if !ok {
-		return 0, fmt.Errorf("failed to read value from Wasm memory for %s", funcName)
+		return 0, fmt.Errorf("failed to read value from Wasm memory for getCtlInt32 call")
 	}
 	return int32(value), nil
 }
@@ -316,12 +317,12 @@ func (enc *Encoder) SetDTX(dtx bool) error {
 	if dtx {
 		val = 1
 	}
-	return enc.setCtlInt32("bridge_encoder_set_dtx", val)
+	return enc.setCtlInt32(enc.wctx.functions.BridgeEncoderSetDtx, val)
 }
 
 // DTX reports whether this encoder is configured to use discontinuous transmission (DTX).
 func (enc *Encoder) DTX() (bool, error) {
-	val, err := enc.getCtlInt32("bridge_encoder_get_dtx")
+	val, err := enc.getCtlInt32(enc.wctx.functions.BridgeEncoderGetDtx)
 	if err != nil {
 		return false, err
 	}
@@ -330,7 +331,7 @@ func (enc *Encoder) DTX() (bool, error) {
 
 // InDTX returns whether the last encoded frame was either a comfort noise update or not encoded due to DTX.
 func (enc *Encoder) InDTX() (bool, error) {
-	val, err := enc.getCtlInt32("bridge_encoder_get_in_dtx")
+	val, err := enc.getCtlInt32(enc.wctx.functions.BridgeEncoderGetInDtx)
 	if err != nil {
 		return false, err
 	}
@@ -339,50 +340,50 @@ func (enc *Encoder) InDTX() (bool, error) {
 
 // SampleRate returns the encoder sample rate in Hz.
 func (enc *Encoder) SampleRate() (int, error) {
-	val, err := enc.getCtlInt32("bridge_encoder_get_sample_rate")
+	val, err := enc.getCtlInt32(enc.wctx.functions.BridgeEncoderGetSampleRate)
 	return int(val), err
 }
 
 // SetBitrate sets the bitrate of the Encoder.
 func (enc *Encoder) SetBitrate(bitrate int) error {
-	return enc.setCtlInt32("bridge_encoder_set_bitrate", int32(bitrate))
+	return enc.setCtlInt32(enc.wctx.functions.BridgeEncoderSetBitrate, int32(bitrate))
 }
 
 // SetBitrateToAuto allows the encoder to automatically set the bitrate.
 func (enc *Encoder) SetBitrateToAuto() error {
-	return enc.setCtlInt32("bridge_encoder_set_bitrate", opusAuto)
+	return enc.setCtlInt32(enc.wctx.functions.BridgeEncoderSetBitrate, opusAuto)
 }
 
 // SetBitrateToMax causes the encoder to use as much rate as it can.
 func (enc *Encoder) SetBitrateToMax() error {
-	return enc.setCtlInt32("bridge_encoder_set_bitrate", opusBitrateMax)
+	return enc.setCtlInt32(enc.wctx.functions.BridgeEncoderSetBitrate, opusBitrateMax)
 }
 
 // Bitrate returns the bitrate of the Encoder.
 func (enc *Encoder) Bitrate() (int, error) {
-	val, err := enc.getCtlInt32("bridge_encoder_get_bitrate")
+	val, err := enc.getCtlInt32(enc.wctx.functions.BridgeEncoderGetBitrate)
 	return int(val), err
 }
 
 // SetComplexity sets the encoder's computational complexity.
 func (enc *Encoder) SetComplexity(complexity int) error {
-	return enc.setCtlInt32("bridge_encoder_set_complexity", int32(complexity))
+	return enc.setCtlInt32(enc.wctx.functions.BridgeEncoderSetComplexity, int32(complexity))
 }
 
 // Complexity returns the computational complexity used by the encoder.
 func (enc *Encoder) Complexity() (int, error) {
-	val, err := enc.getCtlInt32("bridge_encoder_get_complexity")
+	val, err := enc.getCtlInt32(enc.wctx.functions.BridgeEncoderGetComplexity)
 	return int(val), err
 }
 
 // SetMaxBandwidth configures the maximum bandpass that the encoder will select automatically.
 func (enc *Encoder) SetMaxBandwidth(maxBw Bandwidth) error {
-	return enc.setCtlInt32("bridge_encoder_set_max_bandwidth", int32(maxBw))
+	return enc.setCtlInt32(enc.wctx.functions.BridgeEncoderSetMaxBandwidth, int32(maxBw))
 }
 
 // MaxBandwidth gets the encoder's configured maximum allowed bandpass.
 func (enc *Encoder) MaxBandwidth() (Bandwidth, error) {
-	val, err := enc.getCtlInt32("bridge_encoder_get_max_bandwidth")
+	val, err := enc.getCtlInt32(enc.wctx.functions.BridgeEncoderGetMaxBandwidth)
 	return Bandwidth(val), err
 }
 
@@ -392,12 +393,12 @@ func (enc *Encoder) SetInBandFEC(fec bool) error {
 	if fec {
 		val = 1
 	}
-	return enc.setCtlInt32("bridge_encoder_set_inband_fec", val)
+	return enc.setCtlInt32(enc.wctx.functions.BridgeEncoderSetInbandFec, val)
 }
 
 // InBandFEC gets the encoder's configured inband forward error correction (FEC).
 func (enc *Encoder) InBandFEC() (bool, error) {
-	val, err := enc.getCtlInt32("bridge_encoder_get_inband_fec")
+	val, err := enc.getCtlInt32(enc.wctx.functions.BridgeEncoderGetInbandFec)
 	if err != nil {
 		return false, err
 	}
@@ -406,13 +407,49 @@ func (enc *Encoder) InBandFEC() (bool, error) {
 
 // SetPacketLossPerc configures the encoder's expected packet loss percentage.
 func (enc *Encoder) SetPacketLossPerc(lossPerc int) error {
-	return enc.setCtlInt32("bridge_encoder_set_packet_loss_perc", int32(lossPerc))
+	return enc.setCtlInt32(enc.wctx.functions.BridgeEncoderSetPacketLossPerc, int32(lossPerc))
 }
 
 // PacketLossPerc gets the encoder's configured packet loss percentage.
 func (enc *Encoder) PacketLossPerc() (int, error) {
-	val, err := enc.getCtlInt32("bridge_encoder_get_packet_loss_perc")
+	val, err := enc.getCtlInt32(enc.wctx.functions.BridgeEncoderGetPacketLossPerc)
 	return int(val), err
+}
+
+// SetVBR configures the encoder's use of variable bitrate (VBR).
+func (enc *Encoder) SetVBR(vbr bool) error {
+	val := int32(0)
+	if vbr {
+		val = 1
+	}
+	return enc.setCtlInt32(enc.wctx.functions.BridgeEncoderSetVbr, int32(val))
+}
+
+// VBR reports whether this encoder is configured to use variable bitrate (VBR).
+func (enc *Encoder) VBR() (bool, error) {
+	val, err := enc.getCtlInt32(enc.wctx.functions.BridgeEncoderGetVbr)
+	if err != nil {
+		return false, err
+	}
+	return val != 0, err
+}
+
+// SetVBRConstraint configures the encoder's use of constrained VBR.
+func (enc *Encoder) SetVBRConstraint(constraint bool) error {
+	val := int32(0)
+	if constraint {
+		val = 1
+	}
+	return enc.setCtlInt32(enc.wctx.functions.BridgeEncoderSetVbrConstraint, val)
+}
+
+// VBRConstraint reports whether this encoder is configured to use constrained VBR.
+func (enc *Encoder) VBRConstraint() (bool, error) {
+	val, err := enc.getCtlInt32(enc.wctx.functions.BridgeEncoderGetVbrConstraint)
+	if err != nil {
+		return false, err
+	}
+	return val != 0, nil
 }
 
 // Reset resets the codec state to be equivalent to a freshly initialized state.
@@ -420,9 +457,9 @@ func (enc *Encoder) Reset() error {
 	if enc.encoderPtr == 0 || enc.wctx == nil {
 		return errEncUninitialized
 	}
-	resetFunc := enc.wctx.module.ExportedFunction("bridge_encoder_reset_state")
+	resetFunc := enc.wctx.functions.BridgeEncoderResetState
 	if resetFunc == nil {
-		return fmt.Errorf("bridge_encoder_reset_state not found in Wasm module (wctx module: %v)", enc.wctx.module)
+		return fmt.Errorf("bridge_encoder_reset_state not found in Wasm functions cache")
 	}
 	ctx := context.Background()
 	results, err := resetFunc.Call(ctx, uint64(enc.encoderPtr))

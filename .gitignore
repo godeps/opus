@@ -20,3 +20,9 @@ _testmain.go
 *.orig
 
 opus/build
+
+# Ignore the entire build directory and its contents
+/wasm-bridge/build/
+
+# Except for this specific file within the build directory
+!/wasm-bridge/build/wasm_bridge
