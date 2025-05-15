@@ -19,6 +19,4 @@ _testmain.go
 *~
 *.orig
 
-old
-
-build
+opus/build
