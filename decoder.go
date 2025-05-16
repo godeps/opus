@@ -2,7 +2,7 @@
 //
 // License for use of this code is detailed in the LICENSE file
 //
-// Modifications for WebAssembly by [Your Name/Organization]
+// Modifications for WebAssembly by Jiang Yiheng
 
 package opus
 

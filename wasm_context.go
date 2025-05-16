@@ -2,7 +2,7 @@
 //
 // License for use of this code is detailed in the LICENSE file
 //
-// Shared WebAssembly context for libopus-c2go
+// Shared WebAssembly context for libopus
 
 package opus
 

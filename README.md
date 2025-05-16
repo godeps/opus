@@ -1,9 +1,10 @@
-[![Test](https://github.com/hraban/opus/workflows/Test/badge.svg)](https://github.com/hraban/opus/actions?query=workflow%3ATest)
+[![Test](https://github.com/jj11hh/opus/actions/workflows/test.yml/badge.svg)](https://github.com/jj11hh/opus/actions/workflows/test.yml)
+
+This is a fork of `gopkg.in/hraban/opus.v2`, modified to use a WASM build of libopus with wazero, removing the CGo dependency. The modified version is hosted at [github.com/jj11hh/opus](https://github.com/jj11hh/opus).
 
 ## Go wrapper for Opus
 
-This package provides Go bindings for the xiph.org C libraries libopus and
-libopusfile.
+This package provides a Go wrapper for the Opus audio codec, utilizing a WebAssembly (WASM) build of libopus executed via the wazero runtime. This approach eliminates the CGo dependency, making the library self-contained.
 
 The C libraries and docs are hosted at https://opus-codec.org/. This package
 just handles the wrapping in Go, and is unaffiliated with xiph.org.
@@ -13,12 +14,12 @@ Features:
 - ✅ encode and decode raw PCM data to raw Opus data
 - ✅ useful when you control the recording device, _and_ the playback
 - ✅ decode .opus and .ogg files into raw audio data ("PCM")
-- ✅ reuse the system libraries for opus decoding (libopus)
-- ✅ works easily on Linux, Mac and Docker; needs libs on Windows
+- ✅ fully self-contained (no external libopus dependency needed)
+- ✅ works easily on Linux, Mac, Windows, and Docker (thanks to WASM)
 - ❌ does not _create_ .opus or .ogg files (but feel free to send a PR)
 - ❌ does not work with .wav files (you need a separate .wav library for that)
-- ❌ no self-contained binary (you need the xiph.org libopus lib, e.g. through a package manager)
-- ❌ no cross compiling (because it uses CGo)
+- ✅ self-contained binary (WASM build of libopus included)
+- ✅ cross-compiling is straightforward (CGo removed)
 
 Good use cases:
 
@@ -27,8 +28,7 @@ Good use cases:
 
 ## Details
 
-This wrapper provides a Go translation layer for three elements from the
-xiph.org opus libs:
+This wrapper interacts with a WASM build of the xiph.org opus library for:
 
 * encoders
 * decoders
@@ -37,7 +37,9 @@ xiph.org opus libs:
 ### Import
 
 ```go
-import "gopkg.in/hraban/opus.v2"
+import "github.com/jj11hh/opus"
+// or, if you prefer to use the tagged version:
+// import "github.com/jj11hh/opus/v1"
 ```
 
 ### Encoding
@@ -126,8 +128,8 @@ for i := 0; i < n; i++ {
 ```
 
 To handle packet loss from an unreliable network, see the
-[DecodePLC](https://godoc.org/gopkg.in/hraban/opus.v2#Decoder.DecodePLC) and
-[DecodeFEC](https://godoc.org/gopkg.in/hraban/opus.v2#Decoder.DecodeFEC)
+[DecodePLC](https://pkg.go.dev/github.com/jj11hh/opus#Decoder.DecodePLC) and
+[DecodeFEC](https://pkg.go.dev/github.com/jj11hh/opus#Decoder.DecodeFEC)
 options.
 
 ### Streams (and Files)
@@ -163,7 +165,7 @@ for {
 }
 ```
 
-See https://godoc.org/gopkg.in/hraban/opus.v2#Stream for further info.
+See https://pkg.go.dev/github.com/jj11hh/opus#Stream for further info.
 
 ### "My .ogg/.opus file doesn't play!" or "How do I play Opus in VLC / mplayer / ...?"
 
@@ -187,7 +189,9 @@ This libopus wrapper _does_ come with code for _decoding_ an OGG/Opus stream. Ju
 ### API Docs
 
 Go wrapper API reference:
-https://godoc.org/gopkg.in/hraban/opus.v2
+https://pkg.go.dev/github.com/jj11hh/opus
+// or for v1.0.0:
+// https://pkg.go.dev/github.com/jj11hh/opus/v1
 
 Full libopus C API reference:
 https://www.opus-codec.org/docs/opus_api-1.1.3/
@@ -196,100 +200,18 @@ For more examples, see the `_test.go` files.
 
 ## Build & Installation
 
-This package requires libopus and libopusfile development packages to be
-installed on your system. These are available on Debian based systems from
-aptitude as `libopus-dev` and `libopusfile-dev`, and on Mac OS X from homebrew.
+No external C library dependencies are required! This package embeds a WebAssembly (WASM) build of libopus and uses the [wazero](https://wazero.io/) runtime to execute it. This means:
 
-They are linked into the app using pkg-config.
+- No need to install `libopus-dev`, `libopusfile-dev`, or `pkg-config`.
+- `go build` works out of the box.
+- Cross-compilation is simplified as there's no CGo.
+- Docker images don't need special `apt-get` or `brew` installs for Opus.
 
-Debian, Ubuntu, ...:
+You can simply build your Go application:
 ```sh
-sudo apt-get install pkg-config libopus-dev libopusfile-dev
+go build
 ```
-
-Mac:
-```sh
-brew install pkg-config opus opusfile
-```
-
-### Building Without `libopusfile`
-
-This package can be built without `libopusfile` by using the build tag `nolibopusfile`.
-This enables the compilation of statically-linked binaries with no external
-dependencies on operating systems without a static `libopusfile`, such as
-[Alpine Linux](https://pkgs.alpinelinux.org/contents?branch=edge&name=opusfile-dev&arch=x86_64&repo=main).
-
-**Note:** this will disable all file and `Stream` APIs.
-
-To enable this feature, add `-tags nolibopusfile` to your `go build` or `go test` commands:
-
-```sh
-# Build
-go build -tags nolibopusfile ...
-
-# Test
-go test -tags nolibopusfile ./...
-```
-
-### Using in Docker
-
-If your Dockerized app has this library as a dependency (directly or
-indirectly), it will need to install the aforementioned packages, too.
-
-This means you can't use the standard `golang:*-onbuild` images, because those
-will try to build the app from source before allowing you to install extra
-dependencies. Instead, try this as a Dockerfile:
-
-```Dockerfile
-# Choose any golang image, just make sure it doesn't have -onbuild
-FROM golang:1
-
-RUN apt-get update && apt-get -y install libopus-dev libopusfile-dev
-
-# Everything below is copied manually from the official -onbuild image,
-# with the ONBUILD keywords removed.
-
-RUN mkdir -p /go/src/app
-WORKDIR /go/src/app
-
-CMD ["go-wrapper", "run"]
-COPY . /go/src/app
-RUN go-wrapper download
-RUN go-wrapper install
-```
-
-For more information, see <https://hub.docker.com/_/golang/>.
-
-### Linking libopus and libopusfile
-
-The opus and opusfile libraries will be linked into your application
-dynamically. This means everyone who uses the resulting binary will need those
-libraries available on their system. E.g. if you use this wrapper to write a
-music app in Go, everyone using that music app will need libopus and libopusfile
-on their system. On Debian systems the packages are called `libopus0` and
-`libopusfile0`.
-
-The "cleanest" way to do this is to publish your software through a package
-manager and specify libopus and libopusfile as dependencies of your program. If
-that is not an option, you can compile the dynamic libraries yourself and ship
-them with your software as seperate (.dll or .so) files.
-
-On Linux, for example, you would need the libopus.so.0 and libopusfile.so.0
-files in the same directory as the binary. Set your ELF binary's rpath to
-`$ORIGIN` (this is not a shell variable but elf magic):
-
-```sh
-patchelf --set-origin '$ORIGIN' your-app-binary
-```
-
-Now you can run the binary and it will automatically pick up shared library
-files from its own directory.
-
-Wrap it all in a .zip, and ship.
-
-I know there is a similar trick for Mac (involving prefixing the shared library
-names with `./`, which is, arguably, better). And Windows... probably just picks
-up .dll files from the same dir by default? I don't know. But there are ways.
+The sections below regarding `libopusfile` build tags, Docker configurations for C libraries, and linking `libopus`/`libopusfile` are no longer applicable due to the self-contained WASM approach.
 
 ## License
 
