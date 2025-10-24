@@ -1,4 +1,4 @@
-module github.com/jj11hh/opus
+module github.com/godeps/opus
 
 // Use the same version with wazero
 go 1.22.0
