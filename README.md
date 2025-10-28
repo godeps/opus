@@ -1,6 +1,6 @@
-[![Test](https://github.com/jj11hh/opus/actions/workflows/test.yml/badge.svg)](https://github.com/jj11hh/opus/actions/workflows/test.yml)
+[![Test](https://github.com/godeps/opus/actions/workflows/test.yml/badge.svg)](https://github.com/godeps/opus/actions/workflows/test.yml)
 
-This is a fork of `gopkg.in/hraban/opus.v2`, modified to use a WASM build of libopus with wazero, removing the CGo dependency. The modified version is hosted at [github.com/jj11hh/opus](https://github.com/jj11hh/opus).
+This is a fork of `gopkg.in/hraban/opus.v2`, modified to use a WASM build of libopus with wazero, removing the CGo dependency. The modified version is hosted at [github.com/godeps/opus](https://github.com/godeps/opus).
 
 ## Go wrapper for Opus
 
@@ -16,6 +16,7 @@ Features:
 - ✅ decode .opus and .ogg files into raw audio data ("PCM")
 - ✅ fully self-contained (no external libopus dependency needed)
 - ✅ works easily on Linux, Mac, Windows, and Docker (thanks to WASM)
+- ✅ thread-safe WASM module pool with automatic reuse across goroutines
 - ❌ does not _create_ .opus or .ogg files (but feel free to send a PR)
 - ❌ does not work with .wav files (you need a separate .wav library for that)
 - ✅ self-contained binary (WASM build of libopus included)
@@ -34,12 +35,14 @@ This wrapper interacts with a WASM build of the xiph.org opus library for:
 * decoders
 * files & streams
 
+### Concurrency / pooling
+
+The library keeps a pool of WebAssembly module instances behind the scenes. Each encoder/decoder acquires its own instance when created, so you can run multiple goroutines in parallel without additional locking. When an encoder/decoder (or other helper) is released, the underlying instance is returned to the pool for reuse.
+
 ### Import
 
 ```go
-import "github.com/jj11hh/opus"
-// or, if you prefer to use the tagged version:
-// import "github.com/jj11hh/opus/v1"
+import "github.com/godeps/opus"
 ```
 
 ### Encoding
@@ -128,8 +131,8 @@ for i := 0; i < n; i++ {
 ```
 
 To handle packet loss from an unreliable network, see the
-[DecodePLC](https://pkg.go.dev/github.com/jj11hh/opus#Decoder.DecodePLC) and
-[DecodeFEC](https://pkg.go.dev/github.com/jj11hh/opus#Decoder.DecodeFEC)
+[DecodePLC](https://pkg.go.dev/github.com/godeps/opus#Decoder.DecodePLC) and
+[DecodeFEC](https://pkg.go.dev/github.com/godeps/opus#Decoder.DecodeFEC)
 options.
 
 ### Streams (and Files)
@@ -165,7 +168,7 @@ for {
 }
 ```
 
-See https://pkg.go.dev/github.com/jj11hh/opus#Stream for further info.
+See https://pkg.go.dev/github.com/godeps/opus#Stream for further info.
 
 ### "My .ogg/.opus file doesn't play!" or "How do I play Opus in VLC / mplayer / ...?"
 
@@ -189,9 +192,7 @@ This libopus wrapper _does_ come with code for _decoding_ an OGG/Opus stream. Ju
 ### API Docs
 
 Go wrapper API reference:
-https://pkg.go.dev/github.com/jj11hh/opus
-// or for v1.0.0:
-// https://pkg.go.dev/github.com/jj11hh/opus/v1
+https://pkg.go.dev/github.com/godeps/opus
 
 Full libopus C API reference:
 https://www.opus-codec.org/docs/opus_api-1.1.3/

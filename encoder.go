@@ -10,6 +10,7 @@ import (
 	"context"
 	"fmt"
 	"runtime"
+	"sync"
 
 	"github.com/tetratelabs/wazero/api"
 )
@@ -21,6 +22,7 @@ type Encoder struct {
 	wctx       *wasmContext // Shared Wasm context
 	encoderPtr uint32       // Pointer to the OpusEncoder struct in Wasm memory
 	channels   int
+	mu         sync.Mutex
 }
 
 // NewEncoder allocates a new Opus encoder and initializes it.
@@ -43,10 +45,13 @@ func NewEncoder(sampleRate int, channels int, application Application) (*Encoder
 
 	err = enc.init(ctx, sampleRate, channels, application)
 	if err != nil {
+		releaseWasmContext(enc.wctx)
 		return nil, err
 	}
 	// Set finalizer to free Wasm memory when Encoder is GC'd
 	runtime.SetFinalizer(enc, func(e *Encoder) {
+		e.mu.Lock()
+		defer e.mu.Unlock()
 		if e.encoderPtr != 0 && e.wctx != nil && e.wctx.functions.Free != nil {
 			// It's tricky to use context in finalizers.
 			// Using context.Background() here, but be cautious.
@@ -60,6 +65,10 @@ func NewEncoder(sampleRate int, channels int, application Application) (*Encoder
 				fmt.Printf("opus: error freeing Wasm encoder memory in finalizer: %v\n", finErr)
 			}
 			e.encoderPtr = 0 // Mark as freed
+		}
+		if e.wctx != nil {
+			releaseWasmContext(e.wctx)
+			e.wctx = nil
 		}
 	})
 	return enc, nil
@@ -125,6 +134,9 @@ func (enc *Encoder) init(ctx context.Context, sampleRate int, channels int, appl
 
 // Encode raw PCM data (int16) and store the result in the supplied buffer.
 func (enc *Encoder) Encode(pcm []int16, data []byte) (int, error) {
+	enc.mu.Lock()
+	defer enc.mu.Unlock()
+
 	if enc.encoderPtr == 0 {
 		return 0, errEncUninitialized
 	}
@@ -194,6 +206,9 @@ func (enc *Encoder) Encode(pcm []int16, data []byte) (int, error) {
 
 // EncodeFloat32 raw PCM data (float32) and store the result.
 func (enc *Encoder) EncodeFloat32(pcm []float32, data []byte) (int, error) {
+	enc.mu.Lock()
+	defer enc.mu.Unlock()
+
 	if enc.encoderPtr == 0 {
 		return 0, errEncUninitialized
 	}
@@ -261,6 +276,9 @@ func (enc *Encoder) EncodeFloat32(pcm []float32, data []byte) (int, error) {
 // --- Generic CTL Getters/Setters ---
 
 func (enc *Encoder) setCtlInt32(ctlFunc api.Function, value int32) error {
+	enc.mu.Lock()
+	defer enc.mu.Unlock()
+
 	if enc.encoderPtr == 0 || enc.wctx == nil {
 		return errEncUninitialized
 	}
@@ -280,6 +298,9 @@ func (enc *Encoder) setCtlInt32(ctlFunc api.Function, value int32) error {
 }
 
 func (enc *Encoder) getCtlInt32(ctlFunc api.Function) (int32, error) {
+	enc.mu.Lock()
+	defer enc.mu.Unlock()
+
 	if enc.encoderPtr == 0 || enc.wctx == nil {
 		return 0, errEncUninitialized
 	}
@@ -454,6 +475,9 @@ func (enc *Encoder) VBRConstraint() (bool, error) {
 
 // Reset resets the codec state to be equivalent to a freshly initialized state.
 func (enc *Encoder) Reset() error {
+	enc.mu.Lock()
+	defer enc.mu.Unlock()
+
 	if enc.encoderPtr == 0 || enc.wctx == nil {
 		return errEncUninitialized
 	}

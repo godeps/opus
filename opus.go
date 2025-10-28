@@ -26,11 +26,12 @@ const (
 func Version() string {
 	ctx := context.Background() // Context for initialization
 	wctx, err := GetWasmContext(ctx)
-	opusGetVersionString := wctx.module.ExportedFunction("opus_get_version_string")
-
 	if err != nil {
 		log.Fatalf("Failed to get wasm context for decoder: %v", err)
 	}
+	defer releaseWasmContext(wctx)
+
+	opusGetVersionString := wctx.module.ExportedFunction("opus_get_version_string")
 
 	results, err := opusGetVersionString.Call(ctx)
 	if err != nil {

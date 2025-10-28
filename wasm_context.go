@@ -10,7 +10,10 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"runtime"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"unsafe"
 
 	"github.com/tetratelabs/wazero"
@@ -79,19 +82,27 @@ type WasmFunctions struct {
 	GetOpusBitrateMaxAddress             api.Function
 }
 
-// wasmContext holds the shared Wasm runtime, module, and cached functions.
+// wasmContext holds the Wasm module instance and cached functions.
 type wasmContext struct {
-	runtime   wazero.Runtime
+	manager   *wasmManager
 	module    api.Module
-	functions WasmFunctions // Changed from malloc/free fields + map to a struct
-	// Add other shared components here if needed
+	functions WasmFunctions
 }
 
 var (
-	globalWasmContext *wasmContext
+	globalWasmManager *wasmManager
 	wasmInitOnce      sync.Once
 	wasmInitErr       error
 )
+
+type wasmManager struct {
+	runtime         wazero.Runtime
+	compiledModule  wazero.CompiledModule
+	pool            chan *wasmContext
+	poolSize        int
+	createMu        sync.Mutex
+	instanceCounter uint64
+}
 
 // Constants to be loaded from Wasm
 var (
@@ -126,8 +137,6 @@ var ( // Changed from const to var
 // initWasm initializes the Wazero runtime, compiles the wasm module, and loads constants.
 // It is designed to be called multiple times but only executes the initialization logic once.
 func initWasm(ctx context.Context, wasmBinary []byte) error {
-	_ = ctx
-
 	wasmInitOnce.Do(func() {
 		initCtx := context.Background()
 		rt := wazero.NewRuntime(initCtx)
@@ -137,106 +146,201 @@ func initWasm(ctx context.Context, wasmBinary []byte) error {
 		if err != nil {
 			wasmInitErr = fmt.Errorf("failed to compile wasm module: %w", err)
 			log.Printf("initWasm: %v", wasmInitErr)
-			rt.Close(initCtx)
+			_ = rt.Close(initCtx)
 			return
 		}
 
-		cfg := wazero.NewModuleConfig().WithName("opus-global")
-		mod, err := rt.InstantiateModule(initCtx, compiledModule, cfg)
+		poolSize := runtime.NumCPU()
+		if poolSize < 2 {
+			poolSize = 2
+		}
+
+		manager := &wasmManager{
+			runtime:        rt,
+			compiledModule: compiledModule,
+			pool:           make(chan *wasmContext, poolSize),
+			poolSize:       poolSize,
+		}
+
+		// Create an initial context to populate function cache and constants.
+		initialCtx, err := manager.newContext(initCtx)
 		if err != nil {
-			wasmInitErr = fmt.Errorf("failed to instantiate wasm module: %w", err)
+			wasmInitErr = fmt.Errorf("failed to instantiate initial wasm module: %w", err)
 			log.Printf("initWasm: %v", wasmInitErr)
-			rt.Close(initCtx)
-			compiledModule.Close(initCtx)
+			_ = compiledModule.Close(initCtx)
+			_ = rt.Close(initCtx)
 			return
 		}
 
-		var funcs WasmFunctions
-		loadFunc := func(name string) api.Function {
-			f := mod.ExportedFunction(name)
-			if f == nil && wasmInitErr == nil { // Only set error if not already set
-				wasmInitErr = fmt.Errorf("wasm function %s not found", name)
-				log.Printf("initWasm: %v", wasmInitErr)
-			}
-			return f
-		}
-
-		// Common
-		funcs.Malloc = loadFunc("malloc")
-		funcs.Free = loadFunc("free")
-
-		// Encoder functions
-		funcs.OpusEncoderGetSize = loadFunc("opus_encoder_get_size")
-		funcs.OpusEncoderInit = loadFunc("opus_encoder_init")
-		funcs.OpusEncode = loadFunc("opus_encode")
-		funcs.OpusEncodeFloat = loadFunc("opus_encode_float")
-		funcs.BridgeEncoderSetDtx = loadFunc("bridge_encoder_set_dtx")
-		funcs.BridgeEncoderGetDtx = loadFunc("bridge_encoder_get_dtx")
-		funcs.BridgeEncoderGetInDtx = loadFunc("bridge_encoder_get_in_dtx")
-		funcs.BridgeEncoderGetSampleRate = loadFunc("bridge_encoder_get_sample_rate")
-		funcs.BridgeEncoderSetBitrate = loadFunc("bridge_encoder_set_bitrate")
-		funcs.BridgeEncoderGetBitrate = loadFunc("bridge_encoder_get_bitrate")
-		funcs.BridgeEncoderSetComplexity = loadFunc("bridge_encoder_set_complexity")
-		funcs.BridgeEncoderGetComplexity = loadFunc("bridge_encoder_get_complexity")
-		funcs.BridgeEncoderSetMaxBandwidth = loadFunc("bridge_encoder_set_max_bandwidth")
-		funcs.BridgeEncoderGetMaxBandwidth = loadFunc("bridge_encoder_get_max_bandwidth")
-		funcs.BridgeEncoderSetInbandFec = loadFunc("bridge_encoder_set_inband_fec")
-		funcs.BridgeEncoderGetInbandFec = loadFunc("bridge_encoder_get_inband_fec")
-		funcs.BridgeEncoderSetPacketLossPerc = loadFunc("bridge_encoder_set_packet_loss_perc")
-		funcs.BridgeEncoderGetPacketLossPerc = loadFunc("bridge_encoder_get_packet_loss_perc")
-		funcs.BridgeEncoderSetVbr = loadFunc("bridge_encoder_set_vbr")
-		funcs.BridgeEncoderGetVbr = loadFunc("bridge_encoder_get_vbr")
-		funcs.BridgeEncoderSetVbrConstraint = loadFunc("bridge_encoder_set_vbr_constraint")
-		funcs.BridgeEncoderGetVbrConstraint = loadFunc("bridge_encoder_get_vbr_constraint")
-		funcs.BridgeEncoderResetState = loadFunc("bridge_encoder_reset_state")
-
-		// Decoder functions
-		funcs.OpusDecoderGetSize = loadFunc("opus_decoder_get_size")
-		funcs.OpusDecoderInit = loadFunc("opus_decoder_init")
-		funcs.OpusDecode = loadFunc("opus_decode")
-		funcs.OpusDecodeFloat = loadFunc("opus_decode_float")
-		funcs.BridgeDecoderGetLastPacketDuration = loadFunc("bridge_decoder_get_last_packet_duration")
-
-		// Constant getter functions
-		funcs.GetOpusOkAddress = loadFunc("get_opus_ok_address")
-		funcs.GetOpusBadArgAddress = loadFunc("get_opus_bad_arg_address")
-		funcs.GetOpusBufferTooSmallAddress = loadFunc("get_opus_buffer_too_small_address")
-		funcs.GetOpusInternalErrorAddress = loadFunc("get_opus_internal_error_address")
-		funcs.GetOpusInvalidPacketAddress = loadFunc("get_opus_invalid_packet_address")
-		funcs.GetOpusUnimplementedAddress = loadFunc("get_opus_unimplemented_address")
-		funcs.GetOpusInvalidStateAddress = loadFunc("get_opus_invalid_state_address")
-		funcs.GetOpusAllocFailAddress = loadFunc("get_opus_alloc_fail_address")
-		funcs.GetOpusBandwidthNarrowbandAddress = loadFunc("get_opus_bandwidth_narrowband_address")
-		funcs.GetOpusBandwidthMediumbandAddress = loadFunc("get_opus_bandwidth_mediumband_address")
-		funcs.GetOpusBandwidthWidebandAddress = loadFunc("get_opus_bandwidth_wideband_address")
-		funcs.GetOpusBandwidthSuperWidebandAddress = loadFunc("get_opus_bandwidth_superwideband_address")
-		funcs.GetOpusBandwidthFullbandAddress = loadFunc("get_opus_bandwidth_fullband_address")
-		funcs.GetOpusAutoAddress = loadFunc("get_opus_auto_address")
-		funcs.GetOpusBitrateMaxAddress = loadFunc("get_opus_bitrate_max_address")
-
-		if wasmInitErr != nil {
-			// If any function failed to load, wasmInitErr is set. Clean up.
-			rt.Close(initCtx)
-			compiledModule.Close(initCtx)
-			mod.Close(initCtx) // mod might be nil if instantiation failed earlier, but Close handles nil.
-			return
-		}
-
-		globalWasmContext = &wasmContext{
-			runtime:   rt,
-			module:    mod,
-			functions: funcs,
-		}
-
-		if err := loadOpusConstants(initCtx, globalWasmContext); err != nil {
+		if err := loadOpusConstants(initCtx, initialCtx); err != nil {
 			wasmInitErr = fmt.Errorf("failed to load opus constants from wasm: %w", err)
 			log.Printf("initWasm: %v", wasmInitErr)
-			// Cleanup will be handled by CloseWasmContext or finalizers if this part fails
+			initialCtx.close(initCtx)
+			_ = compiledModule.Close(initCtx)
+			_ = rt.Close(initCtx)
 			return
 		}
+
+		manager.release(initialCtx)
+		globalWasmManager = manager
 	})
 
 	return wasmInitErr
+}
+
+func (m *wasmManager) newContext(ctx context.Context) (*wasmContext, error) {
+	if m == nil {
+		return nil, fmt.Errorf("wasm manager is not initialized")
+	}
+
+	m.createMu.Lock()
+	defer m.createMu.Unlock()
+
+	modName := fmt.Sprintf("opus-%d", atomic.AddUint64(&m.instanceCounter, 1))
+	cfg := wazero.NewModuleConfig().WithName(modName)
+	mod, err := m.runtime.InstantiateModule(ctx, m.compiledModule, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to instantiate wasm module: %w", err)
+	}
+
+	wc := &wasmContext{
+		manager: m,
+		module:  mod,
+	}
+	if err := wc.populateFunctions(); err != nil {
+		mod.Close(ctx)
+		return nil, err
+	}
+	return wc, nil
+}
+
+func (m *wasmManager) acquire(ctx context.Context) (*wasmContext, error) {
+	select {
+	case wc := <-m.pool:
+		return wc, nil
+	default:
+		return m.newContext(ctx)
+	}
+}
+
+func (m *wasmManager) release(wc *wasmContext) {
+	if m == nil || wc == nil {
+		return
+	}
+	wc.manager = m
+	select {
+	case m.pool <- wc:
+	default:
+		wc.close(context.Background())
+	}
+}
+
+func (m *wasmManager) close(ctx context.Context) error {
+	if m == nil {
+		return nil
+	}
+	// Drain the pool and close each module.
+	for {
+		select {
+		case wc := <-m.pool:
+			wc.close(ctx)
+		default:
+			goto drained
+		}
+	}
+drained:
+	if m.compiledModule != nil {
+		m.compiledModule.Close(ctx)
+	}
+	if m.runtime != nil {
+		return m.runtime.Close(ctx)
+	}
+	return nil
+}
+
+func (wc *wasmContext) close(ctx context.Context) {
+	if wc == nil || wc.module == nil {
+		return
+	}
+	_ = wc.module.Close(ctx)
+	wc.module = nil
+	wc.functions = WasmFunctions{}
+}
+
+func (wc *wasmContext) populateFunctions() error {
+	if wc == nil || wc.module == nil {
+		return fmt.Errorf("wasm context module uninitialized")
+	}
+
+	var missing []string
+	loadFunc := func(name string) api.Function {
+		f := wc.module.ExportedFunction(name)
+		if f == nil {
+			missing = append(missing, name)
+		}
+		return f
+	}
+
+	var funcs WasmFunctions
+	// Common
+	funcs.Malloc = loadFunc("malloc")
+	funcs.Free = loadFunc("free")
+
+	// Encoder functions
+	funcs.OpusEncoderGetSize = loadFunc("opus_encoder_get_size")
+	funcs.OpusEncoderInit = loadFunc("opus_encoder_init")
+	funcs.OpusEncode = loadFunc("opus_encode")
+	funcs.OpusEncodeFloat = loadFunc("opus_encode_float")
+	funcs.BridgeEncoderSetDtx = loadFunc("bridge_encoder_set_dtx")
+	funcs.BridgeEncoderGetDtx = loadFunc("bridge_encoder_get_dtx")
+	funcs.BridgeEncoderGetInDtx = loadFunc("bridge_encoder_get_in_dtx")
+	funcs.BridgeEncoderGetSampleRate = loadFunc("bridge_encoder_get_sample_rate")
+	funcs.BridgeEncoderSetBitrate = loadFunc("bridge_encoder_set_bitrate")
+	funcs.BridgeEncoderGetBitrate = loadFunc("bridge_encoder_get_bitrate")
+	funcs.BridgeEncoderSetComplexity = loadFunc("bridge_encoder_set_complexity")
+	funcs.BridgeEncoderGetComplexity = loadFunc("bridge_encoder_get_complexity")
+	funcs.BridgeEncoderSetMaxBandwidth = loadFunc("bridge_encoder_set_max_bandwidth")
+	funcs.BridgeEncoderGetMaxBandwidth = loadFunc("bridge_encoder_get_max_bandwidth")
+	funcs.BridgeEncoderSetInbandFec = loadFunc("bridge_encoder_set_inband_fec")
+	funcs.BridgeEncoderGetInbandFec = loadFunc("bridge_encoder_get_inband_fec")
+	funcs.BridgeEncoderSetPacketLossPerc = loadFunc("bridge_encoder_set_packet_loss_perc")
+	funcs.BridgeEncoderGetPacketLossPerc = loadFunc("bridge_encoder_get_packet_loss_perc")
+	funcs.BridgeEncoderSetVbr = loadFunc("bridge_encoder_set_vbr")
+	funcs.BridgeEncoderGetVbr = loadFunc("bridge_encoder_get_vbr")
+	funcs.BridgeEncoderSetVbrConstraint = loadFunc("bridge_encoder_set_vbr_constraint")
+	funcs.BridgeEncoderGetVbrConstraint = loadFunc("bridge_encoder_get_vbr_constraint")
+	funcs.BridgeEncoderResetState = loadFunc("bridge_encoder_reset_state")
+
+	// Decoder functions
+	funcs.OpusDecoderGetSize = loadFunc("opus_decoder_get_size")
+	funcs.OpusDecoderInit = loadFunc("opus_decoder_init")
+	funcs.OpusDecode = loadFunc("opus_decode")
+	funcs.OpusDecodeFloat = loadFunc("opus_decode_float")
+	funcs.BridgeDecoderGetLastPacketDuration = loadFunc("bridge_decoder_get_last_packet_duration")
+
+	// Constant getter functions
+	funcs.GetOpusOkAddress = loadFunc("get_opus_ok_address")
+	funcs.GetOpusBadArgAddress = loadFunc("get_opus_bad_arg_address")
+	funcs.GetOpusBufferTooSmallAddress = loadFunc("get_opus_buffer_too_small_address")
+	funcs.GetOpusInternalErrorAddress = loadFunc("get_opus_internal_error_address")
+	funcs.GetOpusInvalidPacketAddress = loadFunc("get_opus_invalid_packet_address")
+	funcs.GetOpusUnimplementedAddress = loadFunc("get_opus_unimplemented_address")
+	funcs.GetOpusInvalidStateAddress = loadFunc("get_opus_invalid_state_address")
+	funcs.GetOpusAllocFailAddress = loadFunc("get_opus_alloc_fail_address")
+	funcs.GetOpusBandwidthNarrowbandAddress = loadFunc("get_opus_bandwidth_narrowband_address")
+	funcs.GetOpusBandwidthMediumbandAddress = loadFunc("get_opus_bandwidth_mediumband_address")
+	funcs.GetOpusBandwidthWidebandAddress = loadFunc("get_opus_bandwidth_wideband_address")
+	funcs.GetOpusBandwidthSuperWidebandAddress = loadFunc("get_opus_bandwidth_superwideband_address")
+	funcs.GetOpusBandwidthFullbandAddress = loadFunc("get_opus_bandwidth_fullband_address")
+	funcs.GetOpusAutoAddress = loadFunc("get_opus_auto_address")
+	funcs.GetOpusBitrateMaxAddress = loadFunc("get_opus_bitrate_max_address")
+
+	if len(missing) > 0 {
+		return fmt.Errorf("wasm functions not found: %s", strings.Join(missing, ", "))
+	}
+
+	wc.functions = funcs
+	return nil
 }
 
 // mustReadInt32Constant reads an int32 constant from wasm memory via an exported getter function.
@@ -293,21 +397,27 @@ func GetWasmContext(ctx context.Context) (*wasmContext, error) {
 	if err := initWasm(ctx, opusWasmBinary); err != nil {
 		return nil, fmt.Errorf("failed to initialize wasm context: %w", err)
 	}
-	return globalWasmContext, nil
+	if globalWasmManager == nil {
+		return nil, fmt.Errorf("wasm manager not initialized")
+	}
+	return globalWasmManager.acquire(ctx)
+}
+
+// releaseWasmContext returns the wasm context to the internal pool.
+func releaseWasmContext(wc *wasmContext) {
+	if wc == nil || wc.manager == nil {
+		return
+	}
+	wc.manager.release(wc)
 }
 
 // CloseWasmContext closes the global Wasm runtime.
 // This should typically be called when the application exits.
 func CloseWasmContext(ctx context.Context) error {
-	if globalWasmContext != nil && globalWasmContext.runtime != nil {
-		err := globalWasmContext.runtime.Close(ctx)
-		globalWasmContext.runtime = nil // Prevent double close
-		globalWasmContext.module = nil
-		// globalWasmContext.malloc = nil // These are now part of globalWasmContext.functions
-		// globalWasmContext.free = nil
-		globalWasmContext.functions = WasmFunctions{} // Clear cached functions struct
-		globalWasmContext = nil                       // Clear the global context
-		wasmInitOnce = sync.Once{}                    // Reset the initOnce for potential re-init in tests etc.
+	if globalWasmManager != nil {
+		err := globalWasmManager.close(ctx)
+		globalWasmManager = nil
+		wasmInitOnce = sync.Once{}
 		wasmInitErr = nil
 		return err
 	}

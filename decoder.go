@@ -10,6 +10,7 @@ import (
 	"context"
 	"fmt"
 	"runtime"
+	"sync"
 
 	"github.com/tetratelabs/wazero/api" // Added for api.Function type
 	// "unsafe" // Only needed if byte slice helpers using unsafe are copied here directly
@@ -24,6 +25,7 @@ type Decoder struct {
 	decoderPtr  uint32       // Pointer to the OpusDecoder struct in Wasm memory
 	sample_rate int
 	channels    int
+	mu          sync.Mutex
 	// module, malloc, free are now accessed via wctx
 }
 
@@ -49,11 +51,14 @@ func NewDecoder(sampleRate int, channels int) (*Decoder, error) {
 
 	err = dec.Init(sampleRate, channels)
 	if err != nil {
+		releaseWasmContext(dec.wctx)
 		return nil, err
 	}
 
 	// Set finalizer to free Wasm memory when Decoder is GC'd
 	runtime.SetFinalizer(dec, func(d *Decoder) {
+		d.mu.Lock()
+		defer d.mu.Unlock()
 		if d.decoderPtr != 0 && d.wctx != nil && d.wctx.functions.Free != nil {
 			// Similar to Encoder, use context.Background() cautiously.
 			// Directly call Free here as freeMemory helper returns an error we can't easily handle in a finalizer.
@@ -63,12 +68,19 @@ func NewDecoder(sampleRate int, channels int) (*Decoder, error) {
 			}
 			d.decoderPtr = 0 // Mark as freed
 		}
+		if d.wctx != nil {
+			releaseWasmContext(d.wctx)
+			d.wctx = nil
+		}
 	})
 	return dec, nil
 }
 
 // Init initializes a pre-allocated opus decoder.
 func (dec *Decoder) Init(sampleRate int, channels int) error {
+	dec.mu.Lock()
+	defer dec.mu.Unlock()
+
 	if dec.decoderPtr != 0 {
 		return fmt.Errorf("opus decoder already initialized")
 	}
@@ -191,6 +203,9 @@ func (dec *Decoder) decodeInternal(data []byte, pcmPtr uint32, frameSize int, de
 // Decode encoded Opus data into the supplied int16 PCM buffer.
 // Returns the number of decoded samples per channel.
 func (dec *Decoder) Decode(data []byte, pcm []int16) (int, error) {
+	dec.mu.Lock()
+	defer dec.mu.Unlock()
+
 	if dec.wctx == nil {
 		return 0, errDecUninitialized
 	}
@@ -244,6 +259,9 @@ func (dec *Decoder) Decode(data []byte, pcm []int16) (int, error) {
 // DecodeFloat32 encoded Opus data into the supplied float32 PCM buffer.
 // Returns the number of decoded samples per channel.
 func (dec *Decoder) DecodeFloat32(data []byte, pcm []float32) (int, error) {
+	dec.mu.Lock()
+	defer dec.mu.Unlock()
+
 	if dec.wctx == nil {
 		return 0, errDecUninitialized
 	}
@@ -290,6 +308,9 @@ func (dec *Decoder) DecodeFloat32(data []byte, pcm []float32) (int, error) {
 // DecodeFEC decodes a packet with FEC. pcm must be the size of the lost packet.
 // Returns samples decoded per channel.
 func (dec *Decoder) DecodeFEC(data []byte, pcm []int16) (int, error) {
+	dec.mu.Lock()
+	defer dec.mu.Unlock()
+
 	if dec.wctx == nil {
 		return 0, errDecUninitialized
 	}
@@ -332,6 +353,9 @@ func (dec *Decoder) DecodeFEC(data []byte, pcm []int16) (int, error) {
 // DecodeFECFloat32 decodes a packet with FEC. pcm must be the size of the lost packet.
 // Returns samples decoded per channel.
 func (dec *Decoder) DecodeFECFloat32(data []byte, pcm []float32) (int, error) {
+	dec.mu.Lock()
+	defer dec.mu.Unlock()
+
 	if dec.wctx == nil {
 		return 0, errDecUninitialized
 	}
@@ -374,6 +398,9 @@ func (dec *Decoder) DecodeFECFloat32(data []byte, pcm []float32) (int, error) {
 // DecodePLC recovers a lost packet using PLC. pcm must be the size of the lost packet.
 // Returns samples decoded per channel.
 func (dec *Decoder) DecodePLC(pcm []int16) (int, error) {
+	dec.mu.Lock()
+	defer dec.mu.Unlock()
+
 	if dec.wctx == nil {
 		return 0, errDecUninitialized
 	}
@@ -417,6 +444,9 @@ func (dec *Decoder) DecodePLC(pcm []int16) (int, error) {
 // DecodePLCFloat32 recovers a lost packet using PLC. pcm must be the size of the lost packet.
 // Returns samples decoded per channel.
 func (dec *Decoder) DecodePLCFloat32(pcm []float32) (int, error) {
+	dec.mu.Lock()
+	defer dec.mu.Unlock()
+
 	if dec.wctx == nil {
 		return 0, errDecUninitialized
 	}
@@ -458,6 +488,9 @@ func (dec *Decoder) DecodePLCFloat32(pcm []float32) (int, error) {
 
 // LastPacketDuration gets the duration (in samples per channel) of the last successfully decoded/concealed packet.
 func (dec *Decoder) LastPacketDuration() (int, error) {
+	dec.mu.Lock()
+	defer dec.mu.Unlock()
+
 	if dec.decoderPtr == 0 || dec.wctx == nil {
 		return 0, errDecUninitialized
 	}

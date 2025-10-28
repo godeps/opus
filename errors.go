@@ -35,6 +35,7 @@ func (e Error) Error() string {
 		log.Printf("Failed to get wasm context for strerror: %v", err)
 		return fmt.Sprintf("opus: error getting WASM context (%d)", e)
 	}
+	defer releaseWasmContext(wctx)
 
 	opusStrError := wctx.module.ExportedFunction("opus_strerror")
 	if opusStrError == nil {
